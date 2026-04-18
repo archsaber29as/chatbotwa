@@ -1,4 +1,5 @@
 flask
+gunicorn
 twilio
 google-generativeai
 google-auth-oauthlib
