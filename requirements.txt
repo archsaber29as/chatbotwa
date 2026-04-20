@@ -1,9 +1,8 @@
 flask
-gunicorn
 twilio
 google-generativeai
+google-auth
 google-auth-oauthlib
-google-auth-httplib2
 google-api-python-client
 beautifulsoup4
 apscheduler
@@ -11,4 +10,3 @@ sumy
 numpy
 requests
 python-dotenv
-google
