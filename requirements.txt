@@ -1,6 +1,5 @@
 flask
 twilio
-google-generativeai
 google-auth
 google-auth-oauthlib
 google-api-python-client
