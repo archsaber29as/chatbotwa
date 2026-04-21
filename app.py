@@ -14,7 +14,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer
-import sqlite3, requests, os, datetime, pickle, re, json, numpy as np
+import psycopg2, psycopg2.extras, requests, os, datetime, pickle, re, json, numpy as np
 
 app = Flask(__name__)
 
@@ -23,28 +23,34 @@ app = Flask(__name__)
 # Each model has a distinct, specialized role.
 # ================================================================
 MODEL_EMBED      = "gemini-embedding-2-preview"   # Gemini Embedding 2  — semantic memory for notes & ideas
-#                                                  # ⚠️ Verify the exact name at: https://ai.google.dev/gemini-api/docs/models
 MODEL_CLASSIFY   = "gemini-2.5-flash-lite"         # Gemini 2.5 Flash Lite — lightweight intent classification
-MODEL_BRAINSTORM = "gemini-3-flash-preview"                # Gemini 3 Flash        — brainstorming & creative tasks
-#                                                  # ⚠️ Verify availability at: https://ai.google.dev/gemini-api/docs/models
-MODEL_MAIN       = "gemini-2.5-flash"              # Gemini 2.5 Flash      — all other tasks (existing)
+MODEL_BRAINSTORM = "gemini-3-flash-preview"        # Gemini 3 Flash        — brainstorming & creative tasks
+MODEL_MAIN       = "gemini-2.5-flash"              # Gemini 2.5 Flash      — all other tasks
 
 # ================================================================
 # CLIENT & ENV CONFIG
 # ================================================================
-client             = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-NEWS_API_KEY       = os.environ["NEWS_API_KEY"]
-YOUR_NUMBER        = os.environ["YOUR_NUMBER"]
-TWILIO_SID         = os.environ["TWILIO_ACCOUNT_SID"]
-TWILIO_TOKEN       = os.environ["TWILIO_AUTH_TOKEN"]
+client                = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+NEWS_API_KEY          = os.environ["NEWS_API_KEY"]
+YOUR_NUMBER           = os.environ["YOUR_NUMBER"]
+TWILIO_SID            = os.environ["TWILIO_ACCOUNT_SID"]
+TWILIO_TOKEN          = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_SANDBOX_NUMBER = "whatsapp:+14155238886"
-SPREADSHEET_ID     = os.environ["GOOGLE_SHEET_ID"]
+SPREADSHEET_ID        = os.environ["GOOGLE_SHEET_ID"]
+DATABASE_URL          = os.environ["DATABASE_URL"]   # Neon connection string
 
 SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/tasks"
 ]
+
+# ================================================================
+# NEON DB — Connection helper
+# ================================================================
+def get_db():
+    """Return a new psycopg2 connection to Neon PostgreSQL."""
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 # ================================================================
 # GOOGLE AUTH
@@ -73,20 +79,47 @@ calendar_service, sheets_service, tasks_service = get_google_services()
 # DATABASE SETUP
 # ================================================================
 def init_db():
-    conn = sqlite3.connect("bot.db")
-    c = conn.cursor()
-    c.execute("CREATE TABLE IF NOT EXISTS ideas    (id INTEGER PRIMARY KEY, content TEXT, timestamp TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY, content TEXT, remind_at TEXT, done INTEGER DEFAULT 0)")
-    c.execute("CREATE TABLE IF NOT EXISTS notes    (id INTEGER PRIMARY KEY, content TEXT, timestamp TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS tasks    (id INTEGER PRIMARY KEY, content TEXT, timestamp TEXT, done INTEGER DEFAULT 0)")
+    conn = get_db()
+    c    = conn.cursor()
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ideas (
+            id        SERIAL PRIMARY KEY,
+            content   TEXT,
+            timestamp TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id        SERIAL PRIMARY KEY,
+            content   TEXT,
+            remind_at TEXT,
+            done      INTEGER DEFAULT 0
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS notes (
+            id        SERIAL PRIMARY KEY,
+            content   TEXT,
+            timestamp TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id        SERIAL PRIMARY KEY,
+            content   TEXT,
+            timestamp TEXT,
+            done      INTEGER DEFAULT 0
+        )
+    """)
     # Semantic memory: stores embeddings for notes & ideas
     c.execute("""
         CREATE TABLE IF NOT EXISTS embeddings (
-            id          INTEGER PRIMARY KEY,
-            source_type TEXT,       -- 'note' or 'idea'
+            id          SERIAL PRIMARY KEY,
+            source_type TEXT,
             source_id   INTEGER,
             content     TEXT,
-            embedding   BLOB,       -- pickled list[float]
+            embedding   BYTEA,
             timestamp   TEXT
         )
     """)
@@ -115,10 +148,10 @@ def save_embedding(source_type: str, source_id: int, content: str):
     embedding = get_embedding(content)
     if not embedding:
         return
-    conn = sqlite3.connect("bot.db")
-    conn.execute(
-        "INSERT INTO embeddings (source_type, source_id, content, embedding, timestamp) VALUES (?, ?, ?, ?, ?)",
-        (source_type, source_id, content, pickle.dumps(embedding), str(datetime.datetime.now()))
+    conn = get_db()
+    conn.cursor().execute(
+        "INSERT INTO embeddings (source_type, source_id, content, embedding, timestamp) VALUES (%s, %s, %s, %s, %s)",
+        (source_type, source_id, content, psycopg2.Binary(pickle.dumps(embedding)), str(datetime.datetime.now()))
     )
     conn.commit()
     conn.close()
@@ -137,16 +170,16 @@ def semantic_search(query: str, top_k: int = 3, min_score: float = 0.45) -> list
     if not query_embedding:
         return []
 
-    conn  = sqlite3.connect("bot.db")
-    rows  = conn.execute(
-        "SELECT source_type, source_id, content, embedding FROM embeddings"
-    ).fetchall()
+    conn = get_db()
+    c    = conn.cursor()
+    c.execute("SELECT source_type, source_id, content, embedding FROM embeddings")
+    rows = c.fetchall()
     conn.close()
 
     results = []
     for source_type, source_id, content, embedding_blob in rows:
         try:
-            embedding = pickle.loads(embedding_blob)
+            embedding = pickle.loads(bytes(embedding_blob))
             score     = _cosine_similarity(query_embedding, embedding)
             if score >= min_score:
                 results.append({"source_type": source_type, "content": content, "score": score})
@@ -222,7 +255,6 @@ def ai_brainstorm(topic: str) -> str:
         err = str(e).lower()
         print(f"[Brainstorm error] {e}")
         if "not found" in err or "404" in err or "unavailable" in err:
-            # Graceful fallback to main model if Gemini 3 Flash not yet available
             print("[Brainstorm] Falling back to MODEL_MAIN")
             try:
                 response = client.models.generate_content(model=MODEL_MAIN, contents=prompt)
@@ -236,9 +268,9 @@ def ai_brainstorm(topic: str) -> str:
 # ================================================================
 def parse_reminder_with_ai(user_input: str) -> tuple:
     """Use Gemini 2.5 Flash to extract reminder content and datetime."""
-    now     = datetime.datetime.now()
-    today   = now.strftime("%Y-%m-%d %H:%M")
-    year    = now.year
+    now   = datetime.datetime.now()
+    today = now.strftime("%Y-%m-%d %H:%M")
+    year  = now.year
 
     prompt = f"""You are a datetime parser for a reminder bot. Current date and time: {today} (timezone: Asia/Jakarta).
 
@@ -273,13 +305,11 @@ User message: {user_input}"""
         content   = parts[0].strip()
         remind_at = parts[1].strip()
 
-        # Validate the parsed datetime is a real date
         datetime.datetime.strptime(remind_at, "%Y-%m-%d %H:%M")
         return content, remind_at
 
     except Exception as e:
         print(f"[Reminder parse error] {e} | raw response: {getattr(response, 'text', 'N/A') if 'response' in dir() else 'no response'}")
-        # Fallback: tomorrow at 09:00, but warn in content
         fallback_dt = (now + datetime.timedelta(days=1)).strftime("%Y-%m-%d 09:00")
         return user_input, fallback_dt
 
@@ -305,8 +335,10 @@ def ai_chat(user_input: str) -> str:
 # REMINDER → Google Calendar
 # ================================================================
 def save_reminder(text: str, remind_at: str) -> str:
-    conn = sqlite3.connect("bot.db")
-    conn.execute("INSERT INTO reminders (content, remind_at) VALUES (?, ?)", (text, remind_at))
+    conn = get_db()
+    conn.cursor().execute(
+        "INSERT INTO reminders (content, remind_at) VALUES (%s, %s)", (text, remind_at)
+    )
     conn.commit()
     conn.close()
     try:
@@ -328,22 +360,22 @@ def save_reminder(text: str, remind_at: str) -> str:
         dt_pretty = dt.strftime("%A, %d %B %Y at %H:%M")
         return f"⏰ Reminder set for *{dt_pretty}*!\n📅 Also added to Google Calendar."
     except Exception as e:
-        return f"⏰ Reminder saved locally for *{remind_at}*.\n⚠️ Calendar sync failed: {str(e)}"
+        return f"⏰ Reminder saved for *{remind_at}*.\n⚠️ Calendar sync failed: {str(e)}"
 
 # ================================================================
 # IDEAS → Google Sheets + Embedding
 # ================================================================
 def save_idea(text: str) -> str:
-    conn      = sqlite3.connect("bot.db")
-    cursor    = conn.execute(
-        "INSERT INTO ideas (content, timestamp) VALUES (?, ?)",
+    conn   = get_db()
+    c      = conn.cursor()
+    c.execute(
+        "INSERT INTO ideas (content, timestamp) VALUES (%s, %s) RETURNING id",
         (text, str(datetime.datetime.now()))
     )
-    source_id = cursor.lastrowid
+    source_id = c.fetchone()[0]
     conn.commit()
     conn.close()
 
-    # Store embedding for semantic memory (Gemini Embedding 2)
     save_embedding("idea", source_id, text)
 
     try:
@@ -357,7 +389,7 @@ def save_idea(text: str) -> str:
         ).execute()
         return f"💡 Idea saved!\n📊 Also added to Google Sheets.\n🧠 Memorized for semantic search."
     except Exception as e:
-        return f"💡 Idea saved locally.\n🧠 Memorized for semantic search.\n⚠️ Sheets sync failed: {str(e)}"
+        return f"💡 Idea saved.\n🧠 Memorized for semantic search.\n⚠️ Sheets sync failed: {str(e)}"
 
 def get_ideas() -> str:
     try:
@@ -372,8 +404,10 @@ def get_ideas() -> str:
             [f"{i+1}. {r[1]} _({r[0]})_" for i, r in enumerate(recent) if len(r) >= 2]
         )
     except Exception:
-        conn = sqlite3.connect("bot.db")
-        rows = conn.execute("SELECT content, timestamp FROM ideas ORDER BY id DESC LIMIT 10").fetchall()
+        conn = get_db()
+        c    = conn.cursor()
+        c.execute("SELECT content, timestamp FROM ideas ORDER BY id DESC LIMIT 10")
+        rows = c.fetchall()
         conn.close()
         if not rows:
             return "💡 No ideas saved yet."
@@ -385,16 +419,16 @@ def get_ideas() -> str:
 # NOTES → Google Sheets + Embedding
 # ================================================================
 def save_note(text: str) -> str:
-    conn      = sqlite3.connect("bot.db")
-    cursor    = conn.execute(
-        "INSERT INTO notes (content, timestamp) VALUES (?, ?)",
+    conn = get_db()
+    c    = conn.cursor()
+    c.execute(
+        "INSERT INTO notes (content, timestamp) VALUES (%s, %s) RETURNING id",
         (text, str(datetime.datetime.now()))
     )
-    source_id = cursor.lastrowid
+    source_id = c.fetchone()[0]
     conn.commit()
     conn.close()
 
-    # Store embedding for semantic memory (Gemini Embedding 2)
     save_embedding("note", source_id, text)
 
     try:
@@ -408,7 +442,7 @@ def save_note(text: str) -> str:
         ).execute()
         return f"📝 Note saved!\n📊 Also added to Google Sheets.\n🧠 Memorized for semantic search."
     except Exception as e:
-        return f"📝 Note saved locally.\n🧠 Memorized for semantic search.\n⚠️ Sheets sync failed: {str(e)}"
+        return f"📝 Note saved.\n🧠 Memorized for semantic search.\n⚠️ Sheets sync failed: {str(e)}"
 
 def get_notes() -> str:
     try:
@@ -423,8 +457,10 @@ def get_notes() -> str:
             [f"{i+1}. {r[1]} _({r[0]})_" for i, r in enumerate(recent) if len(r) >= 2]
         )
     except Exception:
-        conn = sqlite3.connect("bot.db")
-        rows = conn.execute("SELECT content, timestamp FROM notes ORDER BY id DESC LIMIT 10").fetchall()
+        conn = get_db()
+        c    = conn.cursor()
+        c.execute("SELECT content, timestamp FROM notes ORDER BY id DESC LIMIT 10")
+        rows = c.fetchall()
         conn.close()
         if not rows:
             return "📝 No notes saved yet."
@@ -436,8 +472,11 @@ def get_notes() -> str:
 # TASKS → Google Tasks
 # ================================================================
 def save_task(text: str) -> str:
-    conn = sqlite3.connect("bot.db")
-    conn.execute("INSERT INTO tasks (content, timestamp) VALUES (?, ?)", (text, str(datetime.datetime.now())))
+    conn = get_db()
+    conn.cursor().execute(
+        "INSERT INTO tasks (content, timestamp) VALUES (%s, %s)",
+        (text, str(datetime.datetime.now()))
+    )
     conn.commit()
     conn.close()
     try:
@@ -447,7 +486,7 @@ def save_task(text: str) -> str:
         ).execute()
         return f"✅ Task added!\n📋 Also added to Google Tasks."
     except Exception as e:
-        return f"✅ Task saved locally.\n⚠️ Google Tasks sync failed: {str(e)}"
+        return f"✅ Task saved.\n⚠️ Google Tasks sync failed: {str(e)}"
 
 def get_tasks() -> str:
     try:
@@ -459,8 +498,10 @@ def get_tasks() -> str:
             [f"{i+1}. {t['title']}" for i, t in enumerate(items[:10])]
         )
     except Exception:
-        conn = sqlite3.connect("bot.db")
-        rows = conn.execute("SELECT content FROM tasks WHERE done=0 ORDER BY id DESC LIMIT 10").fetchall()
+        conn = get_db()
+        c    = conn.cursor()
+        c.execute("SELECT content FROM tasks WHERE done=0 ORDER BY id DESC LIMIT 10")
+        rows = c.fetchall()
         conn.close()
         if not rows:
             return "📋 No pending tasks."
@@ -493,24 +534,24 @@ def get_news(topic: str) -> str:
     try:
         data     = requests.get(url, timeout=10).json()
         articles = data.get("articles", [])
-    except Exception as e:
+    except Exception:
         return f"📭 Could not fetch news for *{topic}*. Try again later."
 
     if not articles:
         return f"📭 No news found for *{topic}*."
 
-    a            = articles[0]
-    title        = a.get("title", "No title")
-    source       = a.get("source", {}).get("name", "Unknown source")
-    article_url  = a.get("url", "")
-    published    = a.get("publishedAt", "")[:10]
-    raw_text     = a.get("content") or a.get("description") or ""
+    a           = articles[0]
+    title       = a.get("title", "No title")
+    source      = a.get("source", {}).get("name", "Unknown source")
+    article_url = a.get("url", "")
+    published   = a.get("publishedAt", "")[:10]
+    raw_text    = a.get("content") or a.get("description") or ""
 
     if article_url:
         try:
-            headers     = {"User-Agent": "Mozilla/5.0"}
-            page        = requests.get(article_url, headers=headers, timeout=10)
-            soup        = BeautifulSoup(page.text, "html.parser")
+            headers = {"User-Agent": "Mozilla/5.0"}
+            page    = requests.get(article_url, headers=headers, timeout=10)
+            soup    = BeautifulSoup(page.text, "html.parser")
             for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
                 tag.decompose()
             scraped = " ".join(p.get_text().strip() for p in soup.find_all("p") if len(p.get_text().strip()) > 0)
@@ -586,7 +627,6 @@ User message: {user_input}"""
         response = client.models.generate_content(model=MODEL_MAIN, contents=prompt)
         raw      = re.sub(r"```json|```", "", response.text.strip()).strip()
         data     = json.loads(raw)
-        # Validate start datetime is a real date
         datetime.datetime.strptime(data["start"], "%Y-%m-%d %H:%M")
         if data.get("end"):
             datetime.datetime.strptime(data["end"], "%Y-%m-%d %H:%M")
@@ -600,8 +640,10 @@ def save_event(title: str, start_dt: str, end_dt: str = None, description: str =
         datetime.datetime.strptime(start_dt, "%Y-%m-%d %H:%M") + datetime.timedelta(hours=1)
     ).strftime("%Y-%m-%d %H:%M")
 
-    conn = sqlite3.connect("bot.db")
-    conn.execute("INSERT INTO reminders (content, remind_at) VALUES (?, ?)", (title, start_dt))
+    conn = get_db()
+    conn.cursor().execute(
+        "INSERT INTO reminders (content, remind_at) VALUES (%s, %s)", (title, start_dt)
+    )
     conn.commit()
     conn.close()
 
@@ -631,15 +673,16 @@ def save_event(title: str, start_dt: str, end_dt: str = None, description: str =
 # REMINDER SCHEDULER
 # ================================================================
 def check_and_send_reminders():
-    # Use a 90-second window so reminders are never missed due to scheduler timing drift
     now    = datetime.datetime.now()
     win_lo = (now - datetime.timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M")
     win_hi = (now + datetime.timedelta(seconds=59)).strftime("%Y-%m-%d %H:%M")
-    conn   = sqlite3.connect("bot.db")
-    rows   = conn.execute(
-        "SELECT id, content FROM reminders WHERE remind_at BETWEEN ? AND ? AND done = 0",
+    conn   = get_db()
+    c      = conn.cursor()
+    c.execute(
+        "SELECT id, content FROM reminders WHERE remind_at BETWEEN %s AND %s AND done = 0",
         (win_lo, win_hi)
-    ).fetchall()
+    )
+    rows = c.fetchall()
     if rows:
         twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
         for row in rows:
@@ -648,7 +691,7 @@ def check_and_send_reminders():
                 to=YOUR_NUMBER,
                 body=f"⏰ *Reminder:* {row[1]}"
             )
-            conn.execute("UPDATE reminders SET done = 1 WHERE id = ?", (row[0],))
+            c.execute("UPDATE reminders SET done = 1 WHERE id = %s", (row[0],))
         conn.commit()
     conn.close()
 
@@ -666,12 +709,10 @@ def webhook():
     resp     = MessagingResponse()
     msg      = resp.message()
 
-    # Step 1: Classify intent with Gemini 2.5 Flash Lite
     classified = classify_intent(incoming)
     intent     = classified.get("intent", "chat")
     params     = classified.get("params", {})
 
-    # Step 2: Route to the appropriate handler + model
     if intent == "reminder":
         content, remind_at = parse_reminder_with_ai(incoming)
         msg.body(save_reminder(content, remind_at))
@@ -716,14 +757,12 @@ def webhook():
         msg.body(get_news(topic or "world"))
 
     elif intent == "brainstorm":
-        # Gemini 3 Flash handles this
         topic = params.get("content") or re.sub(
             r"brainstorm|ide|ideas?|pikir|think about|think of", "", lower
         ).strip(" :?!") or incoming
         msg.body(ai_brainstorm(topic))
 
     elif intent == "add_event":
-        # AI-powered natural language event parsing — no strict format required
         parsed = parse_event_with_ai(incoming)
         if parsed and parsed.get("title") and parsed.get("start"):
             msg.body(save_event(
@@ -738,8 +777,8 @@ def webhook():
                 "Try: *Add event Team lunch on April 22 at 1pm*\n"
                 "Or: *New event Meeting tomorrow at 3pm for 2 hours*"
             )
+
     elif intent == "search_memory":
-        # Gemini Embedding 2: semantic search through notes & ideas
         results = semantic_search(incoming, top_k=5, min_score=0.45)
         if results:
             items = [
@@ -750,7 +789,7 @@ def webhook():
         else:
             msg.body("🔍 Nothing relevant found in your notes or ideas.")
 
-    else:  # chat — Gemini 2.5 Flash with memory context
+    else:
         msg.body(ai_chat(incoming))
 
     return str(resp)
