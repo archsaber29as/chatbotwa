@@ -10,3 +10,4 @@ sumy
 numpy
 requests
 python-dotenv
+google-genai
