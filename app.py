@@ -19,6 +19,38 @@ import sqlite3, requests, os, datetime, pickle, re, json, numpy as np, pytz
 app = Flask(__name__)
 
 # ================================================================
+# IN-MEMORY LOG BUFFER — captures prints for WhatsApp & /logs endpoint
+# ================================================================
+import logging, collections, threading
+from io import StringIO
+
+_LOG_BUFFER     = collections.deque(maxlen=200)   # keep last 200 lines
+_LOG_BUFFER_LOCK = threading.Lock()
+
+class _WhatsAppLogHandler(logging.Handler):
+    def emit(self, record):
+        ts  = now_jkt().strftime("%H:%M:%S") if 'now_jkt' in globals() else ""
+        line = f"[{ts}] {record.levelname}: {self.format(record)}"
+        with _LOG_BUFFER_LOCK:
+            _LOG_BUFFER.append(line)
+
+# Intercept all print() calls by redirecting stdout
+import builtins
+_original_print = builtins.print
+def _buffered_print(*args, **kwargs):
+    text = " ".join(str(a) for a in args)
+    ts   = now_jkt().strftime("%H:%M:%S") if 'now_jkt' in globals() else ""
+    with _LOG_BUFFER_LOCK:
+        _LOG_BUFFER.append(f"[{ts}] {text}")
+    _original_print(*args, **kwargs)
+builtins.print = _buffered_print
+
+def get_recent_logs(n: int = 30) -> str:
+    with _LOG_BUFFER_LOCK:
+        lines = list(_LOG_BUFFER)[-n:]
+    return "\n".join(lines) if lines else "No logs yet."
+
+# ================================================================
 # TIMEZONE HELPER — always use Asia/Jakarta "now"
 # ================================================================
 TZ_JKT = pytz.timezone("Asia/Jakarta")
@@ -228,6 +260,7 @@ Classify the user's message into exactly ONE of these intents:
   brainstorm    — brainstorm, explore ideas, get creative suggestions
   add_event     — add a calendar event
   search_memory — ask about something that might be in their notes/ideas
+  show_logs     — show recent bot logs or errors
   chat          — general conversation or anything else
 
 Reply ONLY with a JSON object (no markdown, no preamble):
@@ -801,6 +834,18 @@ def webhook():
                 "Try: *Add event Team lunch on April 22 at 1pm*\n"
                 "Or: *New event Meeting tomorrow at 3pm for 2 hours*"
             )
+    elif intent == "show_logs":
+        n = 20
+        try:
+            # allow "show last 50 logs" etc.
+            nums = re.findall(r"\d+", incoming)
+            if nums:
+                n = min(int(nums[0]), 50)
+        except Exception:
+            pass
+        logs = get_recent_logs(n)
+        msg.body(f"🖥️ *Last {n} log lines:*\n\n```\n{logs}\n```")
+
     elif intent == "search_memory":
         # Gemini Embedding 2: semantic search through notes & ideas
         results = semantic_search(incoming, top_k=5, min_score=0.45)
@@ -817,6 +862,19 @@ def webhook():
         msg.body(ai_chat(incoming))
 
     return str(resp)
+
+# ================================================================
+# /logs — browser-accessible log viewer (protect with LOG_SECRET)
+# ================================================================
+@app.route("/logs")
+def logs_endpoint():
+    secret = os.environ.get("LOG_SECRET", "")
+    if secret and request.args.get("secret") != secret:
+        return "Unauthorized", 401
+    n    = min(int(request.args.get("n", 50)), 200)
+    logs = get_recent_logs(n)
+    # Return as plain text for easy reading on mobile browsers
+    return f"<pre style='font-size:13px;padding:12px'>{logs}</pre>", 200, {"Content-Type": "text/html"}
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
