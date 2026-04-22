@@ -14,9 +14,85 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer
-import sqlite3, requests, os, datetime, pickle, re, json, numpy as np
+import sqlite3, requests, os, datetime, pickle, re, json, numpy as np, pytz
 
 app = Flask(__name__)
+
+# ================================================================
+# IN-MEMORY LOG BUFFER — captures ALL output: print, Flask, Werkzeug, APScheduler
+# ================================================================
+import logging, collections, threading, sys
+
+_LOG_BUFFER      = collections.deque(maxlen=300)
+_LOG_BUFFER_LOCK = threading.Lock()
+
+def _buf(line: str):
+    """Append one line to the buffer (thread-safe)."""
+    with _LOG_BUFFER_LOCK:
+        _LOG_BUFFER.append(line)
+
+def _ts() -> str:
+    """Current time in Asia/Jakarta as HH:MM:SS string."""
+    return datetime.datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+
+# 1. Custom logging handler — attaches to every logger
+class _BufHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg  = self.format(record)
+            _buf(f"[{_ts()}] {record.levelname} {record.name}: {msg}")
+        except Exception:
+            pass
+
+_buf_handler = _BufHandler()
+_buf_handler.setFormatter(logging.Formatter("%(message)s"))
+_buf_handler.setLevel(logging.DEBUG)
+
+# Attach to root logger — catches Flask, Werkzeug, APScheduler, etc.
+logging.getLogger().addHandler(_buf_handler)
+logging.getLogger().setLevel(logging.DEBUG)
+
+# Explicitly attach to Werkzeug (HTTP request lines) and APScheduler
+for _lgr in ("werkzeug", "apscheduler", "apscheduler.executors.default"):
+    _l = logging.getLogger(_lgr)
+    _l.addHandler(_buf_handler)
+    _l.setLevel(logging.DEBUG)
+
+# 2. Intercept stdout so print() calls are also captured
+class _TeeStream:
+    """Writes to both the original stream and the log buffer."""
+    def __init__(self, original):
+        self._orig = original
+    def write(self, text):
+        self._orig.write(text)
+        stripped = text.strip()
+        if stripped:
+            _buf(f"[{_ts()}] {stripped}")
+    def flush(self):
+        self._orig.flush()
+    def __getattr__(self, attr):
+        return getattr(self._orig, attr)
+
+sys.stdout = _TeeStream(sys.stdout)
+sys.stderr = _TeeStream(sys.stderr)
+
+def get_recent_logs(n: int = 30) -> str:
+    with _LOG_BUFFER_LOCK:
+        lines = list(_LOG_BUFFER)[-n:]
+    return "\n".join(lines) if lines else "No logs yet."
+
+# ================================================================
+# TIMEZONE HELPER — always use Asia/Jakarta "now"
+# ================================================================
+TZ_JKT = pytz.timezone("Asia/Jakarta")
+
+def now_jkt() -> datetime.datetime:
+    """Return current datetime in Asia/Jakarta timezone (naive, for DB storage)."""
+    return datetime.datetime.now(TZ_JKT).replace(tzinfo=None)
+
+def localize_jkt(dt: datetime.datetime) -> datetime.datetime:
+    """Attach Asia/Jakarta tzinfo to a naive datetime (for Google Calendar isoformat)."""
+    return TZ_JKT.localize(dt)
 
 # ================================================================
 # MODEL CONFIG
@@ -47,27 +123,60 @@ SCOPES = [
 ]
 
 # ================================================================
-# GOOGLE AUTH
+# GOOGLE AUTH — lazy singleton so a bad token won't crash startup
 # ================================================================
+_google_services_cache = None
+
 def get_google_services():
+    """Return (calendar, sheets, tasks) services. Loads once and caches.
+    Reads token from GOOGLE_TOKEN_B64 env var (base64) or token.pickle file.
+    Raises a clear RuntimeError if no valid credentials are available."""
+    global _google_services_cache
+    if _google_services_cache is not None:
+        return _google_services_cache
+
     creds = None
-    if os.path.exists("token.pickle"):
-        with open("token.pickle", "rb") as token:
-            creds = pickle.load(token)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+
+    # 1. Try env var (base64-encoded pickle) — recommended for Railway
+    token_b64 = os.environ.get("GOOGLE_TOKEN_B64")
+    if token_b64:
+        import base64, io
+        try:
+            creds = pickle.load(io.BytesIO(base64.b64decode(token_b64)))
+            print("[Google Auth] Loaded credentials from GOOGLE_TOKEN_B64")
+        except Exception as e:
+            print(f"[Google Auth] Failed to decode GOOGLE_TOKEN_B64: {e}")
+
+    # 2. Fall back to token.pickle on disk
+    if creds is None and os.path.exists("token.pickle"):
+        with open("token.pickle", "rb") as f:
+            creds = pickle.load(f)
+        print("[Google Auth] Loaded credentials from token.pickle")
+
+    # 3. Refresh if expired
+    if creds and not creds.valid:
+        if creds.expired and creds.refresh_token:
             creds.refresh(Request())
+            print("[Google Auth] Token refreshed successfully")
+            with open("token.pickle", "wb") as f:
+                pickle.dump(creds, f)
         else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open("token.pickle", "wb") as token:
-            pickle.dump(creds, token)
+            raise RuntimeError(
+                "Google credentials are invalid and cannot be refreshed. "
+                "Run refresh_token.py locally and set GOOGLE_TOKEN_B64 on Railway."
+            )
+
+    if creds is None:
+        raise RuntimeError(
+            "No Google credentials found. "
+            "Run refresh_token.py locally and set GOOGLE_TOKEN_B64 on Railway."
+        )
+
     calendar = build("calendar", "v3", credentials=creds)
     sheets   = build("sheets",   "v4", credentials=creds)
     tasks    = build("tasks",    "v1", credentials=creds)
-    return calendar, sheets, tasks
-
-calendar_service, sheets_service, tasks_service = get_google_services()
+    _google_services_cache = (calendar, sheets, tasks)
+    return _google_services_cache
 
 # ================================================================
 # DATABASE SETUP
@@ -118,7 +227,7 @@ def save_embedding(source_type: str, source_id: int, content: str):
     conn = sqlite3.connect("bot.db")
     conn.execute(
         "INSERT INTO embeddings (source_type, source_id, content, embedding, timestamp) VALUES (?, ?, ?, ?, ?)",
-        (source_type, source_id, content, pickle.dumps(embedding), str(datetime.datetime.now()))
+        (source_type, source_id, content, pickle.dumps(embedding), str(now_jkt()))
     )
     conn.commit()
     conn.close()
@@ -182,6 +291,7 @@ Classify the user's message into exactly ONE of these intents:
   brainstorm    — brainstorm, explore ideas, get creative suggestions
   add_event     — add a calendar event
   search_memory — ask about something that might be in their notes/ideas
+  show_logs     — show recent bot logs or errors
   chat          — general conversation or anything else
 
 Reply ONLY with a JSON object (no markdown, no preamble):
@@ -236,7 +346,7 @@ def ai_brainstorm(topic: str) -> str:
 # ================================================================
 def parse_reminder_with_ai(user_input: str) -> tuple:
     """Use Gemini 2.5 Flash to extract reminder content and datetime."""
-    now     = datetime.datetime.now()
+    now     = now_jkt()  # FIX: use Jakarta time, not server UTC
     today   = now.strftime("%Y-%m-%d %H:%M")
     year    = now.year
 
@@ -312,10 +422,13 @@ def save_reminder(text: str, remind_at: str) -> str:
     try:
         dt     = datetime.datetime.strptime(remind_at, "%Y-%m-%d %H:%M")
         dt_end = dt + datetime.timedelta(minutes=30)
+        # FIX: localize datetimes so Google Calendar gets the correct Jakarta offset
+        dt_aware     = localize_jkt(dt)
+        dt_end_aware = localize_jkt(dt_end)
         event  = {
             "summary": f"⏰ {text}",
-            "start":   {"dateTime": dt.isoformat(),     "timeZone": "Asia/Jakarta"},
-            "end":     {"dateTime": dt_end.isoformat(), "timeZone": "Asia/Jakarta"},
+            "start":   {"dateTime": dt_aware.isoformat(),     "timeZone": "Asia/Jakarta"},
+            "end":     {"dateTime": dt_end_aware.isoformat(), "timeZone": "Asia/Jakarta"},
             "reminders": {
                 "useDefault": False,
                 "overrides": [
@@ -324,7 +437,8 @@ def save_reminder(text: str, remind_at: str) -> str:
                 ]
             }
         }
-        calendar_service.events().insert(calendarId="primary", body=event).execute()
+        calendar_svc, _, _ = get_google_services()
+        calendar_svc.events().insert(calendarId="primary", body=event).execute()
         dt_pretty = dt.strftime("%A, %d %B %Y at %H:%M")
         return f"⏰ Reminder set for *{dt_pretty}*!\n📅 Also added to Google Calendar."
     except Exception as e:
@@ -337,7 +451,7 @@ def save_idea(text: str) -> str:
     conn      = sqlite3.connect("bot.db")
     cursor    = conn.execute(
         "INSERT INTO ideas (content, timestamp) VALUES (?, ?)",
-        (text, str(datetime.datetime.now()))
+        (text, str(now_jkt()))  # FIX: Jakarta time
     )
     source_id = cursor.lastrowid
     conn.commit()
@@ -347,8 +461,9 @@ def save_idea(text: str) -> str:
     save_embedding("idea", source_id, text)
 
     try:
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        sheets_service.spreadsheets().values().append(
+        timestamp = now_jkt().strftime("%Y-%m-%d %H:%M")  # FIX: Jakarta time
+        _, sheets_svc, _ = get_google_services()
+        sheets_svc.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
             range="Ideas!A2:B",
             valueInputOption="RAW",
@@ -361,7 +476,8 @@ def save_idea(text: str) -> str:
 
 def get_ideas() -> str:
     try:
-        result = sheets_service.spreadsheets().values().get(
+        _, sheets_svc, _ = get_google_services()
+        result = sheets_svc.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID, range="Ideas!A:B"
         ).execute()
         rows = result.get("values", [])
@@ -388,7 +504,7 @@ def save_note(text: str) -> str:
     conn      = sqlite3.connect("bot.db")
     cursor    = conn.execute(
         "INSERT INTO notes (content, timestamp) VALUES (?, ?)",
-        (text, str(datetime.datetime.now()))
+        (text, str(now_jkt()))  # FIX: Jakarta time
     )
     source_id = cursor.lastrowid
     conn.commit()
@@ -398,8 +514,9 @@ def save_note(text: str) -> str:
     save_embedding("note", source_id, text)
 
     try:
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        sheets_service.spreadsheets().values().append(
+        timestamp = now_jkt().strftime("%Y-%m-%d %H:%M")  # FIX: Jakarta time
+        _, sheets_svc, _ = get_google_services()
+        sheets_svc.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
             range="Notes!A2:B",
             valueInputOption="RAW",
@@ -412,7 +529,8 @@ def save_note(text: str) -> str:
 
 def get_notes() -> str:
     try:
-        result = sheets_service.spreadsheets().values().get(
+        _, sheets_svc, _ = get_google_services()
+        result = sheets_svc.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID, range="Notes!A:B"
         ).execute()
         rows = result.get("values", [])
@@ -437,11 +555,12 @@ def get_notes() -> str:
 # ================================================================
 def save_task(text: str) -> str:
     conn = sqlite3.connect("bot.db")
-    conn.execute("INSERT INTO tasks (content, timestamp) VALUES (?, ?)", (text, str(datetime.datetime.now())))
+    conn.execute("INSERT INTO tasks (content, timestamp) VALUES (?, ?)", (text, str(now_jkt())))  # FIX: Jakarta time
     conn.commit()
     conn.close()
     try:
-        tasks_service.tasks().insert(
+        _, _, tasks_svc = get_google_services()
+        tasks_svc.tasks().insert(
             tasklist="@default",
             body={"title": text, "status": "needsAction"}
         ).execute()
@@ -451,7 +570,8 @@ def save_task(text: str) -> str:
 
 def get_tasks() -> str:
     try:
-        result = tasks_service.tasks().list(tasklist="@default", showCompleted=False).execute()
+        _, _, tasks_svc = get_google_services()
+        result = tasks_svc.tasks().list(tasklist="@default", showCompleted=False).execute()
         items  = result.get("items", [])
         if not items:
             return "📋 No pending tasks."
@@ -468,13 +588,14 @@ def get_tasks() -> str:
 
 def complete_task(keyword: str) -> str:
     try:
-        result  = tasks_service.tasks().list(tasklist="@default", showCompleted=False).execute()
+        _, _, tasks_svc = get_google_services()
+        result  = tasks_svc.tasks().list(tasklist="@default", showCompleted=False).execute()
         items   = result.get("items", [])
         matched = [t for t in items if keyword.lower() in t["title"].lower()]
         if not matched:
             return f"❌ No task found matching '{keyword}'."
         t = matched[0]
-        tasks_service.tasks().patch(
+        tasks_svc.tasks().patch(
             tasklist="@default", task=t["id"], body={"status": "completed"}
         ).execute()
         return f"✅ Task *'{t['title']}'* marked as complete!"
@@ -488,7 +609,7 @@ def get_news(topic: str) -> str:
     url = (
         f"https://newsapi.org/v2/everything"
         f"?q={topic}&apiKey={NEWS_API_KEY}&pageSize=5&language=en&sortBy=relevancy"
-        f"&from={(datetime.datetime.now() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')}"
+        f"&from={(now_jkt() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')}"
     )
     try:
         data     = requests.get(url, timeout=10).json()
@@ -562,7 +683,7 @@ Article content: {raw_text}"""
 # ================================================================
 def parse_event_with_ai(user_input: str) -> dict | None:
     """Use Gemini 2.5 Flash to extract event title, start, end, description from natural language."""
-    now  = datetime.datetime.now()
+    now  = now_jkt()  # FIX: Jakarta time
     year = now.year
     prompt = f"""You are a calendar event parser. Current date and time: {now.strftime("%Y-%m-%d %H:%M")} (timezone: Asia/Jakarta).
 
@@ -609,11 +730,16 @@ def save_event(title: str, start_dt: str, end_dt: str = None, description: str =
     end_pretty   = datetime.datetime.strptime(end_dt,   "%Y-%m-%d %H:%M").strftime("%H:%M")
 
     try:
+        dt_start     = datetime.datetime.strptime(start_dt, "%Y-%m-%d %H:%M")
+        dt_end_obj   = datetime.datetime.strptime(end_dt,   "%Y-%m-%d %H:%M")
+        # FIX: localize so Google Calendar gets the correct Jakarta offset
+        dt_start_aware = localize_jkt(dt_start)
+        dt_end_aware   = localize_jkt(dt_end_obj)
         event = {
             "summary":     title,
             "description": description,
-            "start": {"dateTime": datetime.datetime.strptime(start_dt, "%Y-%m-%d %H:%M").isoformat(), "timeZone": "Asia/Jakarta"},
-            "end":   {"dateTime": datetime.datetime.strptime(end_dt,   "%Y-%m-%d %H:%M").isoformat(), "timeZone": "Asia/Jakarta"},
+            "start": {"dateTime": dt_start_aware.isoformat(), "timeZone": "Asia/Jakarta"},
+            "end":   {"dateTime": dt_end_aware.isoformat(),   "timeZone": "Asia/Jakarta"},
             "reminders": {
                 "useDefault": False,
                 "overrides": [
@@ -622,7 +748,8 @@ def save_event(title: str, start_dt: str, end_dt: str = None, description: str =
                 ]
             }
         }
-        calendar_service.events().insert(calendarId="primary", body=event).execute()
+        calendar_svc, _, _ = get_google_services()
+        calendar_svc.events().insert(calendarId="primary", body=event).execute()
         return f"📅 *{title}* added!\n🗓 {start_pretty} → {end_pretty}"
     except Exception as e:
         return f"⚠️ Could not add event to Calendar: {str(e)}"
@@ -632,7 +759,7 @@ def save_event(title: str, start_dt: str, end_dt: str = None, description: str =
 # ================================================================
 def check_and_send_reminders():
     # Use a 90-second window so reminders are never missed due to scheduler timing drift
-    now    = datetime.datetime.now()
+    now    = now_jkt()  # FIX: Jakarta time
     win_lo = (now - datetime.timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M")
     win_hi = (now + datetime.timedelta(seconds=59)).strftime("%Y-%m-%d %H:%M")
     conn   = sqlite3.connect("bot.db")
@@ -665,6 +792,18 @@ def webhook():
     lower    = incoming.lower()
     resp     = MessagingResponse()
     msg      = resp.message()
+
+    # Step 0: Hard-coded keyword shortcuts — never go through AI classifier
+    _log_triggers = {"show logs", "show log", "lihat log", "cek log", "log error",
+                     "logs", "/logs", "show errors", "bot status", "status bot"}
+    if any(t in lower for t in _log_triggers):
+        n = 20
+        nums = re.findall(r"\d+", incoming)
+        if nums:
+            n = min(int(nums[0]), 50)
+        logs = get_recent_logs(n)
+        msg.body(f"🖥️ *Last {n} log lines:*\n\n{logs}")
+        return str(resp)
 
     # Step 1: Classify intent with Gemini 2.5 Flash Lite
     classified = classify_intent(incoming)
@@ -738,6 +877,18 @@ def webhook():
                 "Try: *Add event Team lunch on April 22 at 1pm*\n"
                 "Or: *New event Meeting tomorrow at 3pm for 2 hours*"
             )
+    elif intent == "show_logs":
+        n = 20
+        try:
+            # allow "show last 50 logs" etc.
+            nums = re.findall(r"\d+", incoming)
+            if nums:
+                n = min(int(nums[0]), 50)
+        except Exception:
+            pass
+        logs = get_recent_logs(n)
+        msg.body(f"🖥️ *Last {n} log lines:*\n\n```\n{logs}\n```")
+
     elif intent == "search_memory":
         # Gemini Embedding 2: semantic search through notes & ideas
         results = semantic_search(incoming, top_k=5, min_score=0.45)
@@ -754,6 +905,41 @@ def webhook():
         msg.body(ai_chat(incoming))
 
     return str(resp)
+
+# ================================================================
+# /logs — browser log viewer, auto-refreshes every 10s
+# Optional: set LOG_SECRET env var to password-protect it
+# If LOG_SECRET is not set, the page is open (fine for personal bots)
+# ================================================================
+@app.route("/logs")
+def logs_endpoint():
+    secret = os.environ.get("LOG_SECRET", "")
+    if secret and request.args.get("secret") != secret:
+        return "Unauthorized — add ?secret=YOUR_LOG_SECRET to the URL", 401
+    n    = min(int(request.args.get("n", 100)), 300)
+    logs = get_recent_logs(n).replace("<", "&lt;").replace(">", "&gt;")
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bot Logs</title>
+  <meta http-equiv="refresh" content="10">
+  <style>
+    body {{ background:#0d1117; color:#c9d1d9; font-family:monospace; font-size:13px; padding:16px; margin:0 }}
+    h2   {{ color:#58a6ff; margin-bottom:8px }}
+    pre  {{ white-space:pre-wrap; word-break:break-all; line-height:1.6 }}
+    .ts  {{ color:#8b949e }}
+    .err {{ color:#ff7b72 }}
+    .ok  {{ color:#56d364 }}
+  </style>
+</head>
+<body>
+  <h2>🖥️ Bot Logs <span style="font-size:11px;color:#8b949e">(auto-refresh 10s · last {n} lines)</span></h2>
+  <pre>{logs}</pre>
+</body>
+</html>"""
+    return html, 200, {"Content-Type": "text/html"}
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
