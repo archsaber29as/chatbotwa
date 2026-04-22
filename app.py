@@ -60,32 +60,60 @@ SCOPES = [
 ]
 
 # ================================================================
-# GOOGLE AUTH
+# GOOGLE AUTH — lazy singleton so a bad token won't crash startup
 # ================================================================
+_google_services_cache = None
+
 def get_google_services():
+    """Return (calendar, sheets, tasks) services. Loads once and caches.
+    Reads token from GOOGLE_TOKEN_B64 env var (base64) or token.pickle file.
+    Raises a clear RuntimeError if no valid credentials are available."""
+    global _google_services_cache
+    if _google_services_cache is not None:
+        return _google_services_cache
+
     creds = None
+
+    # 1. Try env var (base64-encoded pickle) — recommended for Railway
     token_b64 = os.environ.get("GOOGLE_TOKEN_B64")
     if token_b64:
         import base64, io
-        creds = pickle.load(io.BytesIO(base64.b64decode(token_b64)))
-    elif os.path.exists("token.pickle"):
-        with open("token.pickle", "rb") as token:
-            creds = pickle.load(token)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+        try:
+            creds = pickle.load(io.BytesIO(base64.b64decode(token_b64)))
+            print("[Google Auth] Loaded credentials from GOOGLE_TOKEN_B64")
+        except Exception as e:
+            print(f"[Google Auth] Failed to decode GOOGLE_TOKEN_B64: {e}")
+
+    # 2. Fall back to token.pickle on disk
+    if creds is None and os.path.exists("token.pickle"):
+        with open("token.pickle", "rb") as f:
+            creds = pickle.load(f)
+        print("[Google Auth] Loaded credentials from token.pickle")
+
+    # 3. Refresh if expired
+    if creds and not creds.valid:
+        if creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            # Save refreshed token back to env var value on disk as fallback
-            with open("token.pickle", "wb") as token:
-                pickle.dump(creds, token)
+            print("[Google Auth] Token refreshed successfully")
+            with open("token.pickle", "wb") as f:
+                pickle.dump(creds, f)
         else:
             raise RuntimeError(
-                "❌ No valid Google credentials. "
+                "Google credentials are invalid and cannot be refreshed. "
                 "Run refresh_token.py locally and set GOOGLE_TOKEN_B64 on Railway."
             )
+
+    if creds is None:
+        raise RuntimeError(
+            "No Google credentials found. "
+            "Run refresh_token.py locally and set GOOGLE_TOKEN_B64 on Railway."
+        )
+
     calendar = build("calendar", "v3", credentials=creds)
     sheets   = build("sheets",   "v4", credentials=creds)
     tasks    = build("tasks",    "v1", credentials=creds)
-    return calendar, sheets, tasks
+    _google_services_cache = (calendar, sheets, tasks)
+    return _google_services_cache
 
 # ================================================================
 # DATABASE SETUP
@@ -345,7 +373,8 @@ def save_reminder(text: str, remind_at: str) -> str:
                 ]
             }
         }
-        calendar_service.events().insert(calendarId="primary", body=event).execute()
+        calendar_svc, _, _ = get_google_services()
+        calendar_svc.events().insert(calendarId="primary", body=event).execute()
         dt_pretty = dt.strftime("%A, %d %B %Y at %H:%M")
         return f"⏰ Reminder set for *{dt_pretty}*!\n📅 Also added to Google Calendar."
     except Exception as e:
@@ -369,7 +398,8 @@ def save_idea(text: str) -> str:
 
     try:
         timestamp = now_jkt().strftime("%Y-%m-%d %H:%M")  # FIX: Jakarta time
-        sheets_service.spreadsheets().values().append(
+        _, sheets_svc, _ = get_google_services()
+        sheets_svc.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
             range="Ideas!A2:B",
             valueInputOption="RAW",
@@ -382,7 +412,8 @@ def save_idea(text: str) -> str:
 
 def get_ideas() -> str:
     try:
-        result = sheets_service.spreadsheets().values().get(
+        _, sheets_svc, _ = get_google_services()
+        result = sheets_svc.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID, range="Ideas!A:B"
         ).execute()
         rows = result.get("values", [])
@@ -420,7 +451,8 @@ def save_note(text: str) -> str:
 
     try:
         timestamp = now_jkt().strftime("%Y-%m-%d %H:%M")  # FIX: Jakarta time
-        sheets_service.spreadsheets().values().append(
+        _, sheets_svc, _ = get_google_services()
+        sheets_svc.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
             range="Notes!A2:B",
             valueInputOption="RAW",
@@ -433,7 +465,8 @@ def save_note(text: str) -> str:
 
 def get_notes() -> str:
     try:
-        result = sheets_service.spreadsheets().values().get(
+        _, sheets_svc, _ = get_google_services()
+        result = sheets_svc.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID, range="Notes!A:B"
         ).execute()
         rows = result.get("values", [])
@@ -462,7 +495,8 @@ def save_task(text: str) -> str:
     conn.commit()
     conn.close()
     try:
-        tasks_service.tasks().insert(
+        _, _, tasks_svc = get_google_services()
+        tasks_svc.tasks().insert(
             tasklist="@default",
             body={"title": text, "status": "needsAction"}
         ).execute()
@@ -472,7 +506,8 @@ def save_task(text: str) -> str:
 
 def get_tasks() -> str:
     try:
-        result = tasks_service.tasks().list(tasklist="@default", showCompleted=False).execute()
+        _, _, tasks_svc = get_google_services()
+        result = tasks_svc.tasks().list(tasklist="@default", showCompleted=False).execute()
         items  = result.get("items", [])
         if not items:
             return "📋 No pending tasks."
@@ -489,13 +524,14 @@ def get_tasks() -> str:
 
 def complete_task(keyword: str) -> str:
     try:
-        result  = tasks_service.tasks().list(tasklist="@default", showCompleted=False).execute()
+        _, _, tasks_svc = get_google_services()
+        result  = tasks_svc.tasks().list(tasklist="@default", showCompleted=False).execute()
         items   = result.get("items", [])
         matched = [t for t in items if keyword.lower() in t["title"].lower()]
         if not matched:
             return f"❌ No task found matching '{keyword}'."
         t = matched[0]
-        tasks_service.tasks().patch(
+        tasks_svc.tasks().patch(
             tasklist="@default", task=t["id"], body={"status": "completed"}
         ).execute()
         return f"✅ Task *'{t['title']}'* marked as complete!"
@@ -648,7 +684,8 @@ def save_event(title: str, start_dt: str, end_dt: str = None, description: str =
                 ]
             }
         }
-        calendar_service.events().insert(calendarId="primary", body=event).execute()
+        calendar_svc, _, _ = get_google_services()
+        calendar_svc.events().insert(calendarId="primary", body=event).execute()
         return f"📅 *{title}* added!\n🗓 {start_pretty} → {end_pretty}"
     except Exception as e:
         return f"⚠️ Could not add event to Calendar: {str(e)}"
