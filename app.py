@@ -64,23 +64,28 @@ SCOPES = [
 # ================================================================
 def get_google_services():
     creds = None
-    if os.path.exists("token.pickle"):
+    token_b64 = os.environ.get("GOOGLE_TOKEN_B64")
+    if token_b64:
+        import base64, io
+        creds = pickle.load(io.BytesIO(base64.b64decode(token_b64)))
+    elif os.path.exists("token.pickle"):
         with open("token.pickle", "rb") as token:
             creds = pickle.load(token)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
+            # Save refreshed token back to env var value on disk as fallback
+            with open("token.pickle", "wb") as token:
+                pickle.dump(creds, token)
         else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open("token.pickle", "wb") as token:
-            pickle.dump(creds, token)
+            raise RuntimeError(
+                "❌ No valid Google credentials. "
+                "Run refresh_token.py locally and set GOOGLE_TOKEN_B64 on Railway."
+            )
     calendar = build("calendar", "v3", credentials=creds)
     sheets   = build("sheets",   "v4", credentials=creds)
     tasks    = build("tasks",    "v1", credentials=creds)
     return calendar, sheets, tasks
-
-calendar_service, sheets_service, tasks_service = get_google_services()
 
 # ================================================================
 # DATABASE SETUP
