@@ -19,31 +19,62 @@ import sqlite3, requests, os, datetime, pickle, re, json, numpy as np, pytz
 app = Flask(__name__)
 
 # ================================================================
-# IN-MEMORY LOG BUFFER — captures prints for WhatsApp & /logs endpoint
+# IN-MEMORY LOG BUFFER — captures ALL output: print, Flask, Werkzeug, APScheduler
 # ================================================================
-import logging, collections, threading
-from io import StringIO
+import logging, collections, threading, sys
 
-_LOG_BUFFER     = collections.deque(maxlen=200)   # keep last 200 lines
+_LOG_BUFFER      = collections.deque(maxlen=300)
 _LOG_BUFFER_LOCK = threading.Lock()
 
-class _WhatsAppLogHandler(logging.Handler):
-    def emit(self, record):
-        ts  = now_jkt().strftime("%H:%M:%S") if 'now_jkt' in globals() else ""
-        line = f"[{ts}] {record.levelname}: {self.format(record)}"
-        with _LOG_BUFFER_LOCK:
-            _LOG_BUFFER.append(line)
-
-# Intercept all print() calls by redirecting stdout
-import builtins
-_original_print = builtins.print
-def _buffered_print(*args, **kwargs):
-    text = " ".join(str(a) for a in args)
-    ts   = now_jkt().strftime("%H:%M:%S") if 'now_jkt' in globals() else ""
+def _buf(line: str):
+    """Append one line to the buffer (thread-safe)."""
     with _LOG_BUFFER_LOCK:
-        _LOG_BUFFER.append(f"[{ts}] {text}")
-    _original_print(*args, **kwargs)
-builtins.print = _buffered_print
+        _LOG_BUFFER.append(line)
+
+def _ts() -> str:
+    """Current time in Asia/Jakarta as HH:MM:SS string."""
+    return datetime.datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+
+# 1. Custom logging handler — attaches to every logger
+class _BufHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg  = self.format(record)
+            _buf(f"[{_ts()}] {record.levelname} {record.name}: {msg}")
+        except Exception:
+            pass
+
+_buf_handler = _BufHandler()
+_buf_handler.setFormatter(logging.Formatter("%(message)s"))
+_buf_handler.setLevel(logging.DEBUG)
+
+# Attach to root logger — catches Flask, Werkzeug, APScheduler, etc.
+logging.getLogger().addHandler(_buf_handler)
+logging.getLogger().setLevel(logging.DEBUG)
+
+# Explicitly attach to Werkzeug (HTTP request lines) and APScheduler
+for _lgr in ("werkzeug", "apscheduler", "apscheduler.executors.default"):
+    _l = logging.getLogger(_lgr)
+    _l.addHandler(_buf_handler)
+    _l.setLevel(logging.DEBUG)
+
+# 2. Intercept stdout so print() calls are also captured
+class _TeeStream:
+    """Writes to both the original stream and the log buffer."""
+    def __init__(self, original):
+        self._orig = original
+    def write(self, text):
+        self._orig.write(text)
+        stripped = text.strip()
+        if stripped:
+            _buf(f"[{_ts()}] {stripped}")
+    def flush(self):
+        self._orig.flush()
+    def __getattr__(self, attr):
+        return getattr(self._orig, attr)
+
+sys.stdout = _TeeStream(sys.stdout)
+sys.stderr = _TeeStream(sys.stderr)
 
 def get_recent_logs(n: int = 30) -> str:
     with _LOG_BUFFER_LOCK:
