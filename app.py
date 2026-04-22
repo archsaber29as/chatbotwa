@@ -793,6 +793,18 @@ def webhook():
     resp     = MessagingResponse()
     msg      = resp.message()
 
+    # Step 0: Hard-coded keyword shortcuts — never go through AI classifier
+    _log_triggers = {"show logs", "show log", "lihat log", "cek log", "log error",
+                     "logs", "/logs", "show errors", "bot status", "status bot"}
+    if any(t in lower for t in _log_triggers):
+        n = 20
+        nums = re.findall(r"\d+", incoming)
+        if nums:
+            n = min(int(nums[0]), 50)
+        logs = get_recent_logs(n)
+        msg.body(f"🖥️ *Last {n} log lines:*\n\n{logs}")
+        return str(resp)
+
     # Step 1: Classify intent with Gemini 2.5 Flash Lite
     classified = classify_intent(incoming)
     intent     = classified.get("intent", "chat")
@@ -895,17 +907,39 @@ def webhook():
     return str(resp)
 
 # ================================================================
-# /logs — browser-accessible log viewer (protect with LOG_SECRET)
+# /logs — browser log viewer, auto-refreshes every 10s
+# Optional: set LOG_SECRET env var to password-protect it
+# If LOG_SECRET is not set, the page is open (fine for personal bots)
 # ================================================================
 @app.route("/logs")
 def logs_endpoint():
     secret = os.environ.get("LOG_SECRET", "")
     if secret and request.args.get("secret") != secret:
-        return "Unauthorized", 401
-    n    = min(int(request.args.get("n", 50)), 200)
-    logs = get_recent_logs(n)
-    # Return as plain text for easy reading on mobile browsers
-    return f"<pre style='font-size:13px;padding:12px'>{logs}</pre>", 200, {"Content-Type": "text/html"}
+        return "Unauthorized — add ?secret=YOUR_LOG_SECRET to the URL", 401
+    n    = min(int(request.args.get("n", 100)), 300)
+    logs = get_recent_logs(n).replace("<", "&lt;").replace(">", "&gt;")
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bot Logs</title>
+  <meta http-equiv="refresh" content="10">
+  <style>
+    body {{ background:#0d1117; color:#c9d1d9; font-family:monospace; font-size:13px; padding:16px; margin:0 }}
+    h2   {{ color:#58a6ff; margin-bottom:8px }}
+    pre  {{ white-space:pre-wrap; word-break:break-all; line-height:1.6 }}
+    .ts  {{ color:#8b949e }}
+    .err {{ color:#ff7b72 }}
+    .ok  {{ color:#56d364 }}
+  </style>
+</head>
+<body>
+  <h2>🖥️ Bot Logs <span style="font-size:11px;color:#8b949e">(auto-refresh 10s · last {n} lines)</span></h2>
+  <pre>{logs}</pre>
+</body>
+</html>"""
+    return html, 200, {"Content-Type": "text/html"}
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
