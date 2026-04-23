@@ -81,6 +81,16 @@ def get_recent_logs(n: int = 30) -> str:
         lines = list(_LOG_BUFFER)[-n:]
     return "\n".join(lines) if lines else "No logs yet."
 
+@app.after_request
+def _log_http(response):
+    """Log every HTTP request + response body into the buffer."""
+    try:
+        body = response.get_data(as_text=True)
+        _buf(f"[{_ts()}] HTTP {request.method} {request.path} → {response.status_code} | body: {body[:500]}")
+    except Exception:
+        pass
+    return response
+
 # ================================================================
 # TIMEZONE HELPER — always use Asia/Jakarta "now"
 # ================================================================
