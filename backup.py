@@ -100,7 +100,7 @@ def localize_jkt(dt: datetime.datetime) -> datetime.datetime:
 # ================================================================
 MODEL_EMBED      = "gemini-embedding-2-preview"   # Gemini Embedding 2  — semantic memory for notes & ideas
 #                                                  # ⚠️ Verify the exact name at: https://ai.google.dev/gemini-api/docs/models
-MODEL_CLASSIFY   = "gemini-2.5-flash-lite"         # Gemini 2.5 Flash Lite — lightweight intent classification
+MODEL_CLASSIFY   = "gemini-3.1-flash-lite-preview"         # Gemini 2.5 Flash Lite — lightweight intent classification
 MODEL_BRAINSTORM = "gemini-3-flash-preview"                # Gemini 3 Flash        — brainstorming & creative tasks
 #                                                  # ⚠️ Verify availability at: https://ai.google.dev/gemini-api/docs/models
 MODEL_MAIN       = "gemini-2.5-flash"              # Gemini 2.5 Flash      — all other tasks (existing)
@@ -273,29 +273,71 @@ def _memory_context_block(query: str, min_score: float = 0.50) -> str:
     items = [f"- [{m['source_type']}] {m['content']}" for m in memory]
     return "\n\nRelevant from your notes & ideas:\n" + "\n".join(items)
 
+def _parse_date_from_message(text: str) -> str | None:
+    """Use Gemini to extract a YYYY-MM-DD date from a natural language message.
+    Returns None if no specific date found."""
+    now = now_jkt()
+    prompt = f"""Today is {now.strftime("%Y-%m-%d")} (Asia/Jakarta).
+Extract the specific date being referred to in the user's message.
+Reply with ONLY a date in YYYY-MM-DD format, or reply with NONE if no specific date is mentioned.
+
+Examples:
+"remind me about my event on may 10th" → {now.year}-05-10
+"what do I have tomorrow" → {(now + datetime.timedelta(days=1)).strftime("%Y-%m-%d")}
+"show my calendar" → NONE
+"events on 22/04" → {now.year}-04-22
+
+User message: {text}"""
+    try:
+        response = client.models.generate_content(model=MODEL_CLASSIFY, contents=prompt)
+        result   = response.text.strip()
+        if result == "NONE" or not result:
+            return None
+        # Validate it looks like a date
+        datetime.datetime.strptime(result, "%Y-%m-%d")
+        return result
+    except Exception:
+        return None
+
+
 # ================================================================
 # GEMINI 2.5 FLASH LITE — Intent Classifier
 # ================================================================
 _CLASSIFY_PROMPT = """You are an intent classifier for a WhatsApp personal assistant.
+
+IMPORTANT: Understand the full CONTEXT and MEANING of the message first. Do NOT match by keywords alone.
+Ask yourself: is the user trying to CREATE something new, or RETRIEVE/LOOK UP something existing?
+
 Classify the user's message into exactly ONE of these intents:
 
-  reminder      — set a reminder or alarm
-  add_note      — save a note or memo
-  get_notes     — list or read saved notes
-  add_idea      — save an idea
-  get_ideas     — list or read saved ideas
-  add_task      — add a to-do task
-  get_tasks     — list pending tasks
-  complete_task — mark a task as done
+  reminder      — CREATE a new reminder or alarm (user wants to BE reminded later)
+  get_reminders — VIEW or look up existing reminders
+  add_note      — SAVE a new note or memo
+  get_notes     — LIST or read saved notes
+  add_idea      — SAVE a new idea
+  get_ideas     — LIST or read saved ideas
+  add_task      — ADD a new to-do task
+  get_tasks     — LIST or view pending tasks
+  complete_task — MARK a task as done
   news          — get news or headlines
   brainstorm    — brainstorm, explore ideas, get creative suggestions
-  add_event     — add a calendar event
+  add_event     — CREATE / add a new calendar event
+  get_events    — VIEW, check, look up, or list existing calendar events
   search_memory — ask about something that might be in their notes/ideas
   show_logs     — show recent bot logs or errors
   chat          — general conversation or anything else
 
+KEY DISAMBIGUATION RULES (apply these before classifying):
+- "remind me [of/about] an event on X" → get_events (looking up an existing event, NOT setting a reminder)
+- "remind me [of/about] my meeting" → get_events (retrieving existing calendar info)
+- "set a reminder to X" / "remind me to X at Y" → reminder (creating a new reminder/alarm)
+- "what events do I have on X" / "show my calendar for X" / "do I have anything on X" → get_events
+- "add event X" / "schedule X" / "create event X" / "new event X" → add_event
+- "show my reminders" / "list reminders" / "what are my reminders" → get_reminders
+- The word "remind" alone does NOT mean intent=reminder. Look at the full sentence structure.
+
 Reply ONLY with a JSON object (no markdown, no preamble):
-{{"intent": "<intent>", "params": {{"content": "<extracted content if any>", "keyword": "<keyword if applicable>"}}}}
+{{"intent": "<intent>", "params": {{"content": "<extracted content if any>", "keyword": "<keyword if applicable>", "date": "<date if mentioned, e.g. 2025-05-10>"}}}}
 
 User message: {message}"""
 
@@ -755,6 +797,101 @@ def save_event(title: str, start_dt: str, end_dt: str = None, description: str =
         return f"⚠️ Could not add event to Calendar: {str(e)}"
 
 # ================================================================
+# GET EVENTS — look up Google Calendar for a given date/period
+# ================================================================
+def get_events(date_hint: str = None, query: str = "") -> str:
+    """Fetch events from Google Calendar. If date_hint is given (YYYY-MM-DD), show that day.
+    Otherwise show upcoming events for the next 7 days."""
+    try:
+        now = now_jkt()
+        # Parse date from hint if provided
+        if date_hint:
+            try:
+                target = datetime.datetime.strptime(date_hint, "%Y-%m-%d")
+            except ValueError:
+                target = now
+        else:
+            target = now
+
+        day_start = localize_jkt(target.replace(hour=0, minute=0, second=0, microsecond=0))
+        day_end   = localize_jkt(target.replace(hour=23, minute=59, second=59, microsecond=0))
+
+        # If no specific date, show next 7 days
+        if not date_hint:
+            day_start = localize_jkt(now.replace(second=0, microsecond=0))
+            day_end   = localize_jkt((now + datetime.timedelta(days=7)).replace(hour=23, minute=59, second=59))
+
+        calendar_svc, _, _ = get_google_services()
+        result = calendar_svc.events().list(
+            calendarId="primary",
+            timeMin=day_start.isoformat(),
+            timeMax=day_end.isoformat(),
+            maxResults=10,
+            singleEvents=True,
+            orderBy="startTime"
+        ).execute()
+
+        events = result.get("items", [])
+        if not events:
+            label = target.strftime("%A, %d %B %Y") if date_hint else "the next 7 days"
+            return f"📭 No events found for *{label}*."
+
+        label = target.strftime("%A, %d %B %Y") if date_hint else "upcoming 7 days"
+        lines = [f"📅 *Your events — {label}:*\n"]
+        for ev in events:
+            title = ev.get("summary", "(No title)")
+            start = ev.get("start", {})
+            if "dateTime" in start:
+                dt = datetime.datetime.fromisoformat(start["dateTime"])
+                time_str = dt.strftime("%a %d %b, %H:%M")
+            else:
+                time_str = start.get("date", "All day")
+            lines.append(f"• {time_str} — {title}")
+        return "\n".join(lines)
+
+    except Exception as e:
+        print(f"[get_events error] {e}")
+        return f"⚠️ Could not fetch calendar events: {str(e)}"
+
+
+def get_reminders_list(date_hint: str = None) -> str:
+    """List upcoming reminders from the local DB."""
+    conn = sqlite3.connect("bot.db")
+    now  = now_jkt()
+    if date_hint:
+        try:
+            target   = datetime.datetime.strptime(date_hint, "%Y-%m-%d")
+            day_lo   = target.strftime("%Y-%m-%d 00:00")
+            day_hi   = target.strftime("%Y-%m-%d 23:59")
+            rows     = conn.execute(
+                "SELECT content, remind_at FROM reminders WHERE remind_at BETWEEN ? AND ? AND done=0 ORDER BY remind_at",
+                (day_lo, day_hi)
+            ).fetchall()
+            label    = target.strftime("%A, %d %B %Y")
+        except ValueError:
+            rows  = []
+            label = date_hint
+    else:
+        rows  = conn.execute(
+            "SELECT content, remind_at FROM reminders WHERE remind_at >= ? AND done=0 ORDER BY remind_at LIMIT 10",
+            (now.strftime("%Y-%m-%d %H:%M"),)
+        ).fetchall()
+        label = "upcoming"
+    conn.close()
+
+    if not rows:
+        return f"⏰ No {label} reminders found."
+    lines = [f"⏰ *Your {label} reminders:*\n"]
+    for content, remind_at in rows:
+        try:
+            dt = datetime.datetime.strptime(remind_at, "%Y-%m-%d %H:%M")
+            lines.append(f"• {dt.strftime('%a %d %b, %H:%M')} — {content}")
+        except Exception:
+            lines.append(f"• {remind_at} — {content}")
+    return "\n".join(lines)
+
+
+# ================================================================
 # REMINDER SCHEDULER
 # ================================================================
 def check_and_send_reminders():
@@ -815,6 +952,10 @@ def webhook():
         content, remind_at = parse_reminder_with_ai(incoming)
         msg.body(save_reminder(content, remind_at))
 
+    elif intent == "get_reminders":
+        date_hint = params.get("date") or None
+        msg.body(get_reminders_list(date_hint))
+
     elif intent == "complete_task":
         keyword = params.get("keyword") or re.sub(
             r"complete task|finish task|done task|selesai task", "", lower
@@ -860,6 +1001,13 @@ def webhook():
             r"brainstorm|ide|ideas?|pikir|think about|think of", "", lower
         ).strip(" :?!") or incoming
         msg.body(ai_brainstorm(topic))
+
+    elif intent == "get_events":
+        date_hint = params.get("date") or None
+        # If no date was extracted by classifier, try to parse it with AI
+        if not date_hint:
+            date_hint = _parse_date_from_message(incoming)
+        msg.body(get_events(date_hint, incoming))
 
     elif intent == "add_event":
         # AI-powered natural language event parsing — no strict format required
