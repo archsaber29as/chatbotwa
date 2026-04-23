@@ -343,6 +343,38 @@ User message: {message}"""
 
 def classify_intent(text: str) -> dict:
     """Use Gemini 2.5 Flash Lite to classify the user's intent."""
+    prompt = f"""
+You are an intent classification assistant. Your task is to analyze the given user input and determine the most appropriate intent from the predefined list below.
+
+Instructions:
+- Read the input carefully.
+- Identify the primary intent (choose ONLY ONE).
+- Do not explain your reasoning.
+- Return ONLY the intent label (no extra text).
+
+Available intents:
+- reminder: create a reminder
+- get_reminders: retrieve all reminders
+- complete_task: mark a task as completed
+- get_tasks: retrieve all tasks
+- add_task: create a new task
+- get_notes: retrieve notes
+- add_note: create a new note
+- get_ideas: retrieve ideas
+- add_idea: add a new idea
+- news: retrieve news or current events
+- brainstorm: discuss or explore ideas interactively
+- get_events: retrieve calendar events
+- add_event: create a calendar event
+- show_logs: retrieve activity logs
+- search_memory: search past stored inputs or memory
+
+Output format:
+- Return only one of the intent labels exactly as written above.
+
+Input:
+{{user_input}}
+"""
     try:
         response = client.models.generate_content(
             model=MODEL_CLASSIFY,
@@ -1090,4 +1122,4 @@ def logs_endpoint():
     return html, 200, {"Content-Type": "text/html"}
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", debug=True,port=int(os.environ.get("PORT", 5000)))
