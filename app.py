@@ -951,6 +951,7 @@ def webhook():
         if nums:
             n = min(int(nums[0]), 50)
         logs = get_recent_logs(n)
+        logs_truncated = logs[-1400:]  # Take only the LAST 1400 chars
         msg.body(f"🖥️ *Last {n} log lines:*\n\n{logs}")
         return str(resp)
 
