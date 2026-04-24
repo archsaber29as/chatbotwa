@@ -359,7 +359,9 @@ def classify_intent(text: str) -> dict:
             contents=_CLASSIFY_PROMPT.format(message=text)
         )
         raw = re.sub(r"```json|```", "", response.text.strip()).strip()
-        return json.loads(raw)
+        result = json.loads(raw)
+        print(f"[Classify] Input: '{text}' → {result}")  # ADD THIS
+        return result
     except Exception as e:
         print(f"[Classify error] {e}")
         return {"intent": "chat", "params": {}}
