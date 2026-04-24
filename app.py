@@ -15,7 +15,6 @@ from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer
 import sqlite3, requests, os, datetime, pickle, re, json, numpy as np, pytz
-from groq import Groq
 
 app = Flask(__name__)
 
@@ -115,11 +114,7 @@ MODEL_CLASSIFY   = "gemini-3.1-flash-lite-preview"         # Gemini 2.5 Flash Li
 MODEL_BRAINSTORM = "gemini-3-flash-preview"                # Gemini 3 Flash        — brainstorming & creative tasks
 #                                                  # ⚠️ Verify availability at: https://ai.google.dev/gemini-api/docs/models
 MODEL_MAIN       = "gemini-3.1-flash-lite-preview"              # Gemini 2.5 Flash      — all other tasks (existing)
-# =========================
-# GROQ MODELS
-# =========================
-MODEL_CLASSIFY   = "llama-3.1-8b-instant"   # FAST intent classification
-MODEL_FALLBACK   = "llama-3.1-8b-instant"   # fallback universal
+
 # ================================================================
 # CLIENT & ENV CONFIG
 # ================================================================
@@ -136,30 +131,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/tasks"
 ]
-
-def generate_with_fallback(primary_model, prompt):
-    """Try primary model → fallback if error"""
-    try:
-        response = client.models.generate_content(
-            model=primary_model,
-            contents=prompt
-        )
-        return response.text.strip()
-
-    except Exception as e:
-        print(f"[Primary model error] {e}")
-        print("[Fallback] Switching to fallback model...")
-
-        try:
-            response = client.models.generate_content(
-                model=MODEL_FALLBACK,
-                contents=prompt
-            )
-            return response.text.strip()
-
-        except Exception as e2:
-            print(f"[Fallback error] {e2}")
-            raise Exception("Both primary and fallback models failed")
 
 # ================================================================
 # GOOGLE AUTH — lazy singleton so a bad token won't crash startup
@@ -328,8 +299,8 @@ Examples:
 
 User message: {text}"""
     try:
-        result_text = generate_with_fallback(MODEL_MAIN, prompt)
-        result   = result_text.text.strip()
+        response = client.models.generate_content(model=MODEL_CLASSIFY, contents=prompt)
+        result   = response.text.strip()
         if result == "NONE" or not result:
             return None
         # Validate it looks like a date
@@ -383,11 +354,11 @@ User message: {message}"""
 def classify_intent(text: str) -> dict:
     """Use Gemini 2.5 Flash Lite to classify the user's intent."""
     try:
-        raw_text = generate_with_fallback(
-          MODEL_CLASSIFY,
-            _CLASSIFY_PROMPT.format(message=text)
+        response = client.models.generate_content(
+            model=MODEL_CLASSIFY,
+            contents=_CLASSIFY_PROMPT.format(message=text)
         )
-        raw = re.sub(r"```json|```", "", raw_text.text.strip()).strip()
+        raw = re.sub(r"```json|```", "", response.text.strip()).strip()
         result = json.loads(raw)
         print(f"[Classify] Input: '{text}' → {result}")  # ADD THIS
         return result
@@ -409,8 +380,8 @@ def ai_brainstorm(topic: str) -> str:
         f"End with one short motivational line."
     )
     try:
-        result_text = generate_with_fallback(MODEL_MAIN, prompt)
-        return f"🧠 *Brainstorm: {topic}*\n\n{result_text.text.strip()}"
+        response = client.models.generate_content(model=MODEL_BRAINSTORM, contents=prompt)
+        return f"🧠 *Brainstorm: {topic}*\n\n{response.text.strip()}"
     except Exception as e:
         err = str(e).lower()
         print(f"[Brainstorm error] {e}")
@@ -418,16 +389,11 @@ def ai_brainstorm(topic: str) -> str:
             # Graceful fallback to main model if Gemini 3 Flash not yet available
             print("[Brainstorm] Falling back to MODEL_MAIN")
             try:
-                # primary brainstorm model
-                return generate_with_fallback(MODEL_BRAINSTORM, prompt)
-
+                response = client.models.generate_content(model=MODEL_MAIN, contents=prompt)
+                return f"🧠 *Brainstorm: {topic}*\n\n{response.text.strip()}"
             except Exception:
-                print("[Brainstorm] fallback to MAIN")
-
-                try:
-                    return generate_with_fallback(MODEL_MAIN, prompt)
-                except Exception:
-                    return "⚠️ Brainstorm failed."
+                pass
+        return "⚠️ Brainstorm failed. Please try again!"
 
 # ================================================================
 # GEMINI 2.5 FLASH — General AI (existing + enhanced with memory)
@@ -462,7 +428,8 @@ Examples:
 User message: {user_input}"""
 
     try:
-        raw = generate_with_fallback(MODEL_MAIN, prompt)
+        response  = client.models.generate_content(model=MODEL_MAIN, contents=prompt)
+        raw       = response.text.strip()
         parts     = raw.split("|")
         if len(parts) < 2:
             raise ValueError("No pipe separator in response")
@@ -475,7 +442,7 @@ User message: {user_input}"""
         return content, remind_at
 
     except Exception as e:
-        print(f"[Reminder parse error] {e} | raw response: {getattr(raw, 'text', 'N/A') if 'response' in dir() else 'no response'}")
+        print(f"[Reminder parse error] {e} | raw response: {getattr(response, 'text', 'N/A') if 'response' in dir() else 'no response'}")
         # Fallback: tomorrow at 09:00, but warn in content
         fallback_dt = (now + datetime.timedelta(days=1)).strftime("%Y-%m-%d 09:00")
         return user_input, fallback_dt
@@ -488,9 +455,15 @@ def ai_chat(user_input: str) -> str:
         f"{memory_ctx}\n\nUser: {user_input}"
     )
     try:
-        return generate_with_fallback(MODEL_MAIN, prompt)
+        response = client.models.generate_content(model=MODEL_MAIN, contents=prompt)
+        return response.text.strip()
     except Exception as e:
-        return "⚠️ Both main and fallback models failed."
+        err = str(e)
+        if "503" in err or "UNAVAILABLE" in err:
+            return "⚠️ AI temporarily overloaded. Try again in a moment!"
+        if "429" in err or "QUOTA" in err:
+            return "⚠️ API quota reached. Try again later."
+        return "⚠️ Something went wrong. Please try again."
 
 # ================================================================
 # REMINDER → Google Calendar
@@ -745,8 +718,8 @@ Article title: {title}
 Article content: {raw_text}"""
 
     try:
-        result_text = generate_with_fallback(MODEL_MAIN, prompt)
-        summary  = result_text.text.strip()
+        response = client.models.generate_content(model=MODEL_MAIN, contents=prompt)
+        summary  = response.text.strip()
     except Exception as e:
         print(f"[News summary error] {e}")
         summary = raw_text[:500] + "..."
@@ -785,8 +758,8 @@ Reply ONLY as valid JSON with no markdown or preamble:
 
 User message: {user_input}"""
     try:
-        result_text = generate_with_fallback(MODEL_MAIN, prompt)
-        raw      = re.sub(r"```json|```", "", result_text.text.strip()).strip()
+        response = client.models.generate_content(model=MODEL_MAIN, contents=prompt)
+        raw      = re.sub(r"```json|```", "", response.text.strip()).strip()
         data     = json.loads(raw)
         # Validate start datetime is a real date
         datetime.datetime.strptime(data["start"], "%Y-%m-%d %H:%M")
