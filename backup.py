@@ -81,6 +81,16 @@ def get_recent_logs(n: int = 30) -> str:
         lines = list(_LOG_BUFFER)[-n:]
     return "\n".join(lines) if lines else "No logs yet."
 
+@app.after_request
+def _log_http(response):
+    """Log every HTTP request + response body into the buffer."""
+    try:
+        body = response.get_data(as_text=True)
+        _buf(f"[{_ts()}] HTTP {request.method} {request.path} → {response.status_code} | body: {body[:500]}")
+    except Exception:
+        pass
+    return response
+
 # ================================================================
 # TIMEZONE HELPER — always use Asia/Jakarta "now"
 # ================================================================
@@ -103,7 +113,7 @@ MODEL_EMBED      = "gemini-embedding-2-preview"   # Gemini Embedding 2  — sema
 MODEL_CLASSIFY   = "gemini-3.1-flash-lite-preview"         # Gemini 2.5 Flash Lite — lightweight intent classification
 MODEL_BRAINSTORM = "gemini-3-flash-preview"                # Gemini 3 Flash        — brainstorming & creative tasks
 #                                                  # ⚠️ Verify availability at: https://ai.google.dev/gemini-api/docs/models
-MODEL_MAIN       = "gemini-2.5-flash"              # Gemini 2.5 Flash      — all other tasks (existing)
+MODEL_MAIN       = "gemini-3.1-flash-lite-preview"              # Gemini 2.5 Flash      — all other tasks (existing)
 
 # ================================================================
 # CLIENT & ENV CONFIG
@@ -343,45 +353,15 @@ User message: {message}"""
 
 def classify_intent(text: str) -> dict:
     """Use Gemini 2.5 Flash Lite to classify the user's intent."""
-    prompt = f"""
-You are an intent classification assistant. Your task is to analyze the given user input and determine the most appropriate intent from the predefined list below.
-
-Instructions:
-- Read the input carefully.
-- Identify the primary intent (choose ONLY ONE).
-- Do not explain your reasoning.
-- Return ONLY the intent label (no extra text).
-
-Available intents:
-- reminder: create a reminder
-- get_reminders: retrieve all reminders
-- complete_task: mark a task as completed
-- get_tasks: retrieve all tasks
-- add_task: create a new task
-- get_notes: retrieve notes
-- add_note: create a new note
-- get_ideas: retrieve ideas
-- add_idea: add a new idea
-- news: retrieve news or current events
-- brainstorm: discuss or explore ideas interactively
-- get_events: retrieve calendar events
-- add_event: create a calendar event
-- show_logs: retrieve activity logs
-- search_memory: search past stored inputs or memory
-
-Output format:
-- Return only one of the intent labels exactly as written above.
-
-Input:
-{{user_input}}
-"""
     try:
         response = client.models.generate_content(
             model=MODEL_CLASSIFY,
             contents=_CLASSIFY_PROMPT.format(message=text)
         )
         raw = re.sub(r"```json|```", "", response.text.strip()).strip()
-        return json.loads(raw)
+        result = json.loads(raw)
+        print(f"[Classify] Input: '{text}' → {result}")  # ADD THIS
+        return result
     except Exception as e:
         print(f"[Classify error] {e}")
         return {"intent": "chat", "params": {}}
@@ -971,6 +951,7 @@ def webhook():
         if nums:
             n = min(int(nums[0]), 50)
         logs = get_recent_logs(n)
+        logs_truncated = logs[-1400:]  # Take only the LAST 1400 chars
         msg.body(f"🖥️ *Last {n} log lines:*\n\n{logs}")
         return str(resp)
 
