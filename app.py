@@ -113,7 +113,7 @@ MODEL_EMBED      = "gemini-embedding-2-preview"   # Gemini Embedding 2  — sema
 MODEL_CLASSIFY   = "gemini-3.1-flash-lite-preview"         # Gemini 2.5 Flash Lite — lightweight intent classification
 MODEL_BRAINSTORM = "gemini-3-flash-preview"                # Gemini 3 Flash        — brainstorming & creative tasks
 #                                                  # ⚠️ Verify availability at: https://ai.google.dev/gemini-api/docs/models
-MODEL_MAIN       = "gemini-2.5-flash"              # Gemini 2.5 Flash      — all other tasks (existing)
+MODEL_MAIN       = "gemini-3.1-flash-lite-preview"              # Gemini 2.5 Flash      — all other tasks (existing)
 
 # ================================================================
 # CLIENT & ENV CONFIG
