@@ -14,6 +14,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer
+from groq import Groq
 import sqlite3, requests, os, datetime, pickle, re, json, numpy as np, pytz
 
 app = Flask(__name__)
@@ -106,25 +107,25 @@ def localize_jkt(dt: datetime.datetime) -> datetime.datetime:
 
 # ================================================================
 # MODEL CONFIG
-# Each model has a distinct, specialized role.
+# MODEL_EMBED      : Gemini Embedding 2    — semantic memory (tetap Gemini)
+# MODEL_BRAINSTORM : Gemini 3 Flash        — brainstorming & creative tasks (tetap Gemini)
+# MODEL_GROQ       : Groq Llama 3.1 8B    — classifier, main chat, semua parser
 # ================================================================
-MODEL_EMBED      = "gemini-embedding-2-preview"   # Gemini Embedding 2  — semantic memory for notes & ideas
-#                                                  # ⚠️ Verify the exact name at: https://ai.google.dev/gemini-api/docs/models
-MODEL_CLASSIFY   = "gemini-3.1-flash-lite-preview"         # Gemini 2.5 Flash Lite — lightweight intent classification
-MODEL_BRAINSTORM = "gemini-3-flash-preview"                # Gemini 3 Flash        — brainstorming & creative tasks
-#                                                  # ⚠️ Verify availability at: https://ai.google.dev/gemini-api/docs/models
-MODEL_MAIN       = "gemini-3.1-flash-lite-preview"              # Gemini 2.5 Flash      — all other tasks (existing)
+MODEL_EMBED      = "gemini-embedding-2-preview"   # Gemini Embedding 2 — semantic memory
+MODEL_BRAINSTORM = "gemini-3-flash-preview"        # Gemini 3 Flash     — brainstorming
+MODEL_GROQ       = "llama-3.1-8b-instant"          # Groq               — classifier, main chat, parser
 
 # ================================================================
 # CLIENT & ENV CONFIG
 # ================================================================
-client             = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-NEWS_API_KEY       = os.environ["NEWS_API_KEY"]
-YOUR_NUMBER        = os.environ["YOUR_NUMBER"]
-TWILIO_SID         = os.environ["TWILIO_ACCOUNT_SID"]
-TWILIO_TOKEN       = os.environ["TWILIO_AUTH_TOKEN"]
+gemini_client         = genai.Client(api_key=os.environ["GEMINI_API_KEY"])  # untuk embedding & brainstorm
+groq_client           = Groq(api_key=os.environ["GROQ_API_KEY"])            # untuk classifier, chat, parser
+NEWS_API_KEY          = os.environ["NEWS_API_KEY"]
+YOUR_NUMBER           = os.environ["YOUR_NUMBER"]
+TWILIO_SID            = os.environ["TWILIO_ACCOUNT_SID"]
+TWILIO_TOKEN          = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_SANDBOX_NUMBER = "whatsapp:+14155238886"
-SPREADSHEET_ID     = os.environ["GOOGLE_SHEET_ID"]
+SPREADSHEET_ID        = os.environ["GOOGLE_SHEET_ID"]
 
 SCOPES = [
     "https://www.googleapis.com/auth/calendar",
@@ -215,12 +216,12 @@ def init_db():
 init_db()
 
 # ================================================================
-# GEMINI EMBEDDING 2 — Semantic Memory
+# GEMINI EMBEDDING 2 — Semantic Memory (tetap menggunakan Gemini)
 # ================================================================
 def get_embedding(text: str) -> list:
     """Generate an embedding vector for the given text using Gemini Embedding 2."""
     try:
-        result = client.models.embed_content(
+        result = gemini_client.models.embed_content(
             model=MODEL_EMBED,
             contents=text
         )
@@ -283,8 +284,29 @@ def _memory_context_block(query: str, min_score: float = 0.50) -> str:
     items = [f"- [{m['source_type']}] {m['content']}" for m in memory]
     return "\n\nRelevant from your notes & ideas:\n" + "\n".join(items)
 
+# ================================================================
+# GROQ HELPER — wrapper untuk semua Groq text completion calls
+# ================================================================
+def _groq_complete(system_prompt: str, user_prompt: str, max_tokens: int = 1024, temperature: float = 0.7) -> str:
+    """Call Groq llama-3.1-8b-instant and return the text response."""
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
+
+    response = groq_client.chat.completions.create(
+        model=MODEL_GROQ,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    return response.choices[0].message.content.strip()
+
+# ================================================================
+# DATE PARSER — menggunakan Groq
+# ================================================================
 def _parse_date_from_message(text: str) -> str | None:
-    """Use Gemini to extract a YYYY-MM-DD date from a natural language message.
+    """Use Groq to extract a YYYY-MM-DD date from a natural language message.
     Returns None if no specific date found."""
     now = now_jkt()
     prompt = f"""Today is {now.strftime("%Y-%m-%d")} (Asia/Jakarta).
@@ -299,8 +321,8 @@ Examples:
 
 User message: {text}"""
     try:
-        response = client.models.generate_content(model=MODEL_CLASSIFY, contents=prompt)
-        result   = response.text.strip()
+        result = _groq_complete("", prompt, max_tokens=20, temperature=0.0)
+        result = result.strip()
         if result == "NONE" or not result:
             return None
         # Validate it looks like a date
@@ -309,9 +331,8 @@ User message: {text}"""
     except Exception:
         return None
 
-
 # ================================================================
-# GEMINI 2.5 FLASH LITE — Intent Classifier
+# GROQ — Intent Classifier (menggantikan Gemini 2.5 Flash Lite)
 # ================================================================
 _CLASSIFY_PROMPT = """You are an intent classifier for a WhatsApp personal assistant.
 
@@ -352,25 +373,27 @@ Reply ONLY with a JSON object (no markdown, no preamble):
 User message: {message}"""
 
 def classify_intent(text: str) -> dict:
-    """Use Gemini 2.5 Flash Lite to classify the user's intent."""
+    """Use Groq Llama 3.1 8B to classify the user's intent."""
     try:
-        response = client.models.generate_content(
-            model=MODEL_CLASSIFY,
-            contents=_CLASSIFY_PROMPT.format(message=text)
+        raw = _groq_complete(
+            system_prompt="You are an intent classifier. Always reply with valid JSON only. No markdown, no explanation.",
+            user_prompt=_CLASSIFY_PROMPT.format(message=text),
+            max_tokens=256,
+            temperature=0.0,
         )
-        raw = re.sub(r"```json|```", "", response.text.strip()).strip()
+        raw    = re.sub(r"```json|```", "", raw).strip()
         result = json.loads(raw)
-        print(f"[Classify] Input: '{text}' → {result}")  # ADD THIS
+        print(f"[Classify] Input: '{text}' → {result}")
         return result
     except Exception as e:
         print(f"[Classify error] {e}")
         return {"intent": "chat", "params": {}}
 
 # ================================================================
-# GEMINI 3 FLASH — Brainstorming
+# GEMINI 3 FLASH — Brainstorming (tetap menggunakan Gemini)
 # ================================================================
 def ai_brainstorm(topic: str) -> str:
-    """Use Gemini 3 Flash for deep brainstorming, enriched with semantic memory."""
+    """Use Gemini 3 Flash for brainstorming, enriched with semantic memory."""
     memory_ctx = _memory_context_block(topic, min_score=0.45)
     prompt = (
         f"You are an enthusiastic brainstorming partner on WhatsApp.\n"
@@ -380,29 +403,28 @@ def ai_brainstorm(topic: str) -> str:
         f"End with one short motivational line."
     )
     try:
-        response = client.models.generate_content(model=MODEL_BRAINSTORM, contents=prompt)
+        response = gemini_client.models.generate_content(model=MODEL_BRAINSTORM, contents=prompt)
         return f"🧠 *Brainstorm: {topic}*\n\n{response.text.strip()}"
     except Exception as e:
         err = str(e).lower()
         print(f"[Brainstorm error] {e}")
         if "not found" in err or "404" in err or "unavailable" in err:
-            # Graceful fallback to main model if Gemini 3 Flash not yet available
-            print("[Brainstorm] Falling back to MODEL_MAIN")
+            print("[Brainstorm] Falling back to Groq")
             try:
-                response = client.models.generate_content(model=MODEL_MAIN, contents=prompt)
-                return f"🧠 *Brainstorm: {topic}*\n\n{response.text.strip()}"
+                result = _groq_complete("", prompt, max_tokens=1024, temperature=0.8)
+                return f"🧠 *Brainstorm: {topic}*\n\n{result}"
             except Exception:
                 pass
         return "⚠️ Brainstorm failed. Please try again!"
 
 # ================================================================
-# GEMINI 2.5 FLASH — General AI (existing + enhanced with memory)
+# GROQ — General AI + Reminder Parser + Event Parser (menggantikan Gemini 2.5 Flash)
 # ================================================================
 def parse_reminder_with_ai(user_input: str) -> tuple:
-    """Use Gemini 2.5 Flash to extract reminder content and datetime."""
-    now     = now_jkt()  # FIX: use Jakarta time, not server UTC
-    today   = now.strftime("%Y-%m-%d %H:%M")
-    year    = now.year
+    """Use Groq to extract reminder content and datetime."""
+    now   = now_jkt()
+    today = now.strftime("%Y-%m-%d %H:%M")
+    year  = now.year
 
     prompt = f"""You are a datetime parser for a reminder bot. Current date and time: {today} (timezone: Asia/Jakarta).
 
@@ -428,9 +450,8 @@ Examples:
 User message: {user_input}"""
 
     try:
-        response  = client.models.generate_content(model=MODEL_MAIN, contents=prompt)
-        raw       = response.text.strip()
-        parts     = raw.split("|")
+        raw   = _groq_complete("", prompt, max_tokens=64, temperature=0.0)
+        parts = raw.split("|")
         if len(parts) < 2:
             raise ValueError("No pipe separator in response")
 
@@ -442,26 +463,24 @@ User message: {user_input}"""
         return content, remind_at
 
     except Exception as e:
-        print(f"[Reminder parse error] {e} | raw response: {getattr(response, 'text', 'N/A') if 'response' in dir() else 'no response'}")
-        # Fallback: tomorrow at 09:00, but warn in content
+        print(f"[Reminder parse error] {e}")
         fallback_dt = (now + datetime.timedelta(days=1)).strftime("%Y-%m-%d 09:00")
         return user_input, fallback_dt
 
 def ai_chat(user_input: str) -> str:
-    """General chat using Gemini 2.5 Flash, enriched with semantic memory context."""
+    """General chat using Groq Llama 3.1 8B, enriched with semantic memory context."""
     memory_ctx = _memory_context_block(user_input, min_score=0.55)
     prompt = (
         f"You are a helpful WhatsApp personal assistant. Reply concisely and friendly."
         f"{memory_ctx}\n\nUser: {user_input}"
     )
     try:
-        response = client.models.generate_content(model=MODEL_MAIN, contents=prompt)
-        return response.text.strip()
+        return _groq_complete("", prompt, max_tokens=1024, temperature=0.7)
     except Exception as e:
         err = str(e)
         if "503" in err or "UNAVAILABLE" in err:
             return "⚠️ AI temporarily overloaded. Try again in a moment!"
-        if "429" in err or "QUOTA" in err:
+        if "429" in err or "rate_limit" in err.lower():
             return "⚠️ API quota reached. Try again later."
         return "⚠️ Something went wrong. Please try again."
 
@@ -505,7 +524,7 @@ def save_idea(text: str) -> str:
     conn      = sqlite3.connect("bot.db")
     cursor    = conn.execute(
         "INSERT INTO ideas (content, timestamp) VALUES (?, ?)",
-        (text, str(now_jkt()))  # FIX: Jakarta time
+        (text, str(now_jkt()))
     )
     source_id = cursor.lastrowid
     conn.commit()
@@ -515,7 +534,7 @@ def save_idea(text: str) -> str:
     save_embedding("idea", source_id, text)
 
     try:
-        timestamp = now_jkt().strftime("%Y-%m-%d %H:%M")  # FIX: Jakarta time
+        timestamp = now_jkt().strftime("%Y-%m-%d %H:%M")
         _, sheets_svc, _ = get_google_services()
         sheets_svc.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
@@ -558,7 +577,7 @@ def save_note(text: str) -> str:
     conn      = sqlite3.connect("bot.db")
     cursor    = conn.execute(
         "INSERT INTO notes (content, timestamp) VALUES (?, ?)",
-        (text, str(now_jkt()))  # FIX: Jakarta time
+        (text, str(now_jkt()))
     )
     source_id = cursor.lastrowid
     conn.commit()
@@ -568,7 +587,7 @@ def save_note(text: str) -> str:
     save_embedding("note", source_id, text)
 
     try:
-        timestamp = now_jkt().strftime("%Y-%m-%d %H:%M")  # FIX: Jakarta time
+        timestamp = now_jkt().strftime("%Y-%m-%d %H:%M")
         _, sheets_svc, _ = get_google_services()
         sheets_svc.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
@@ -609,7 +628,7 @@ def get_notes() -> str:
 # ================================================================
 def save_task(text: str) -> str:
     conn = sqlite3.connect("bot.db")
-    conn.execute("INSERT INTO tasks (content, timestamp) VALUES (?, ?)", (text, str(now_jkt())))  # FIX: Jakarta time
+    conn.execute("INSERT INTO tasks (content, timestamp) VALUES (?, ?)", (text, str(now_jkt())))
     conn.commit()
     conn.close()
     try:
@@ -657,7 +676,7 @@ def complete_task(keyword: str) -> str:
         return f"⚠️ Could not complete task: {str(e)}"
 
 # ================================================================
-# NEWS → sumy + Gemini 2.5 Flash summary
+# NEWS → sumy + Groq summary (menggantikan Gemini 2.5 Flash)
 # ================================================================
 def get_news(topic: str) -> str:
     url = (
@@ -718,8 +737,7 @@ Article title: {title}
 Article content: {raw_text}"""
 
     try:
-        response = client.models.generate_content(model=MODEL_MAIN, contents=prompt)
-        summary  = response.text.strip()
+        summary = _groq_complete("", prompt, max_tokens=1024, temperature=0.5)
     except Exception as e:
         print(f"[News summary error] {e}")
         summary = raw_text[:500] + "..."
@@ -733,11 +751,11 @@ Article content: {raw_text}"""
     )
 
 # ================================================================
-# CALENDAR EVENT
+# CALENDAR EVENT — menggunakan Groq
 # ================================================================
 def parse_event_with_ai(user_input: str) -> dict | None:
-    """Use Gemini 2.5 Flash to extract event title, start, end, description from natural language."""
-    now  = now_jkt()  # FIX: Jakarta time
+    """Use Groq to extract event title, start, end, description from natural language."""
+    now  = now_jkt()
     year = now.year
     prompt = f"""You are a calendar event parser. Current date and time: {now.strftime("%Y-%m-%d %H:%M")} (timezone: Asia/Jakarta).
 
@@ -758,9 +776,14 @@ Reply ONLY as valid JSON with no markdown or preamble:
 
 User message: {user_input}"""
     try:
-        response = client.models.generate_content(model=MODEL_MAIN, contents=prompt)
-        raw      = re.sub(r"```json|```", "", response.text.strip()).strip()
-        data     = json.loads(raw)
+        raw  = _groq_complete(
+            system_prompt="You are a calendar event parser. Reply with valid JSON only. No markdown, no explanation.",
+            user_prompt=prompt,
+            max_tokens=256,
+            temperature=0.0,
+        )
+        raw  = re.sub(r"```json|```", "", raw).strip()
+        data = json.loads(raw)
         # Validate start datetime is a real date
         datetime.datetime.strptime(data["start"], "%Y-%m-%d %H:%M")
         if data.get("end"):
@@ -955,12 +978,12 @@ def webhook():
         msg.body(f"🖥️ *Last {n} log lines:*\n\n{logs}")
         return str(resp)
 
-    # Step 1: Classify intent with Gemini 2.5 Flash Lite
+    # Step 1: Classify intent dengan Groq Llama 3.1 8B
     classified = classify_intent(incoming)
     intent     = classified.get("intent", "chat")
     params     = classified.get("params", {})
 
-    # Step 2: Route to the appropriate handler + model
+    # Step 2: Route to the appropriate handler
     if intent == "reminder":
         content, remind_at = parse_reminder_with_ai(incoming)
         msg.body(save_reminder(content, remind_at))
@@ -1009,7 +1032,6 @@ def webhook():
         msg.body(get_news(topic or "world"))
 
     elif intent == "brainstorm":
-        # Gemini 3 Flash handles this
         topic = params.get("content") or re.sub(
             r"brainstorm|ide|ideas?|pikir|think about|think of", "", lower
         ).strip(" :?!") or incoming
@@ -1062,7 +1084,7 @@ def webhook():
         else:
             msg.body("🔍 Nothing relevant found in your notes or ideas.")
 
-    else:  # chat — Gemini 2.5 Flash with memory context
+    else:  # chat — Groq Llama 3.1 8B with memory context
         msg.body(ai_chat(incoming))
 
     return str(resp)
