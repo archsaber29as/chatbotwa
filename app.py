@@ -24,51 +24,89 @@ app = Flask(__name__)
 # ================================================================
 import logging, threading, sys
 
-_LOG_FILE      = "bot.log"
-_LOG_FILE_LOCK = threading.Lock()
+# bot_all.log     → everything: werkzeug, apscheduler, httpx, stdout, all HTTP
+#                   used by /logs browser endpoint
+# bot_webhook.log → only httpx INFO + HTTP POST /webhook
+#                   used by WhatsApp "logs" command
+_ALL_LOG_FILE      = "bot_all.log"
+_WH_LOG_FILE       = "bot_webhook.log"
+_LOG_FILE_LOCK     = threading.Lock()
 
 def _ts() -> str:
     """Current time in Asia/Jakarta as HH:MM:SS string."""
     return datetime.datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
 
-def _buf(line: str):
-    """Append one line to the shared log file (thread-safe, cross-worker)."""
+def _write(path: str, line: str):
+    """Append one line to a log file (thread-safe, cross-worker)."""
     with _LOG_FILE_LOCK:
         try:
-            with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except Exception:
             pass
 
-# 1. Custom logging handler — attaches to every logger
-class _BufHandler(logging.Handler):
+def _buf_all(line: str):
+    """Write to the full log (browser /logs)."""
+    _write(_ALL_LOG_FILE, line)
+
+def _buf_webhook(line: str):
+    """Write to the filtered log (WhatsApp chatbot)."""
+    _write(_WH_LOG_FILE, line)
+
+# 1. Handler for ALL loggers — goes to bot_all.log only
+class _AllHandler(logging.Handler):
     def emit(self, record):
         try:
-            msg  = self.format(record)
-            _buf(f"[{_ts()}] {record.levelname} {record.name}: {msg}")
+            msg = self.format(record)
+            _buf_all(f"[{_ts()}] {record.levelname} {record.name}: {msg}")
         except Exception:
             pass
 
-_buf_handler = _BufHandler()
-_buf_handler.setFormatter(logging.Formatter("%(message)s"))
-_buf_handler.setLevel(logging.INFO)
+# 2. Handler for httpx only — goes to BOTH log files
+class _HttpxHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            line = f"[{_ts()}] {record.levelname} {record.name}: {msg}"
+            _buf_all(line)
+            _buf_webhook(line)
+        except Exception:
+            pass
 
-# Attach only to httpx at INFO — no root / werkzeug / apscheduler noise
+_all_handler = _AllHandler()
+_all_handler.setFormatter(logging.Formatter("%(message)s"))
+_all_handler.setLevel(logging.DEBUG)
+
+_httpx_handler = _HttpxHandler()
+_httpx_handler.setFormatter(logging.Formatter("%(message)s"))
+_httpx_handler.setLevel(logging.INFO)
+
+# Root logger — catches Flask, Werkzeug, APScheduler, etc. → bot_all.log only
+logging.getLogger().addHandler(_all_handler)
+logging.getLogger().setLevel(logging.DEBUG)
+
+# Werkzeug + APScheduler → bot_all.log only
+for _lgr_name in ("werkzeug", "apscheduler", "apscheduler.executors.default"):
+    _l = logging.getLogger(_lgr_name)
+    _l.addHandler(_all_handler)
+    _l.setLevel(logging.DEBUG)
+
+# httpx → both log files, at INFO only
 _httpx_logger = logging.getLogger("httpx")
-_httpx_logger.addHandler(_buf_handler)
+_httpx_logger.addHandler(_httpx_handler)
 _httpx_logger.setLevel(logging.INFO)
 _httpx_logger.propagate = False  # prevent double-logging via root
 
-# 2. Intercept stdout so print() calls are also captured
+# 3. Intercept stdout so print() calls go to bot_all.log only
 class _TeeStream:
-    """Writes to both the original stream and the log buffer."""
+    """Writes to both the original stream and the full log file."""
     def __init__(self, original):
         self._orig = original
     def write(self, text):
         self._orig.write(text)
         stripped = text.strip()
         if stripped:
-            _buf(f"[{_ts()}] {stripped}")
+            _buf_all(f"[{_ts()}] {stripped}")
     def flush(self):
         self._orig.flush()
     def __getattr__(self, attr):
@@ -77,11 +115,11 @@ class _TeeStream:
 sys.stdout = _TeeStream(sys.stdout)
 sys.stderr = _TeeStream(sys.stderr)
 
-def get_recent_logs(n: int = 30) -> str:
-    """Read the last n lines from the shared log file — works across all workers."""
+def _read_log_file(path: str, n: int) -> str:
+    """Read the last n lines from a log file."""
     try:
         with _LOG_FILE_LOCK:
-            with open(_LOG_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
         recent = [l.rstrip("\n") for l in lines[-n:]]
         return "\n".join(recent) if recent else "No logs yet."
@@ -90,13 +128,23 @@ def get_recent_logs(n: int = 30) -> str:
     except Exception as e:
         return f"Error reading logs: {e}"
 
+def get_recent_logs(n: int = 30) -> str:
+    """WhatsApp chatbot: only httpx INFO + HTTP /webhook."""
+    return _read_log_file(_WH_LOG_FILE, n)
+
+def get_all_logs(n: int = 100) -> str:
+    """Browser /logs: full log including werkzeug, apscheduler, etc."""
+    return _read_log_file(_ALL_LOG_FILE, n)
+
 @app.after_request
 def _log_http(response):
-    """Log HTTP requests — /webhook path only."""
+    """All HTTP → bot_all.log; /webhook only → also bot_webhook.log."""
     try:
+        body = response.get_data(as_text=True)
+        line = f"[{_ts()}] HTTP {request.method} {request.path} → {response.status_code} | body: {body[:500]}"
+        _buf_all(line)
         if request.path == "/webhook":
-            body = response.get_data(as_text=True)
-            _buf(f"[{_ts()}] HTTP {request.method} {request.path} → {response.status_code} | body: {body[:500]}")
+            _buf_webhook(line)
     except Exception:
         pass
     return response
@@ -1120,7 +1168,7 @@ def logs_endpoint():
     if secret and request.args.get("secret") != secret:
         return "Unauthorized — add ?secret=YOUR_LOG_SECRET to the URL", 401
     n    = min(int(request.args.get("n", 100)), 300)
-    logs = get_recent_logs(n).replace("<", "&lt;").replace(">", "&gt;")
+    logs = get_all_logs(n).replace("<", "&lt;").replace(">", "&gt;")
     html = f"""<!DOCTYPE html>
 <html>
 <head>
