@@ -24,36 +24,113 @@ app = Flask(__name__)
 # ================================================================
 import logging, threading, sys
 
-# bot_all.log     → everything: werkzeug, apscheduler, httpx, stdout, all HTTP
-#                   used by /logs browser endpoint
-# bot_webhook.log → only httpx INFO + HTTP POST /webhook
-#                   used by WhatsApp "logs" command
-_ALL_LOG_FILE      = "bot_all.log"
-_WH_LOG_FILE       = "bot_webhook.log"
-_LOG_FILE_LOCK     = threading.Lock()
+# ----------------------------------------------------------------
+# LOGGING STRATEGY
+#   bot_all.log   → everything (werkzeug, apscheduler, httpx, stdout, all HTTP)
+#                   used by browser /logs endpoint
+#   Google Sheet  → only httpx INFO + HTTP /webhook
+#   (tab=BotLogs)   written via background queue → read by WhatsApp "logs" command
+# ----------------------------------------------------------------
+import time, collections as _collections
+
+_ALL_LOG_FILE   = "bot_all.log"
+_ALL_LOG_LOCK   = threading.Lock()
+
+# Queue for pending Google Sheet rows: each item is [timestamp_str, log_str]
+_SHEET_QUEUE      = _collections.deque()
+_SHEET_QUEUE_LOCK = threading.Lock()
+
+# Cache of tab names already created/verified this process run
+_CREATED_LOG_TABS      = set()
+_CREATED_LOG_TABS_LOCK = threading.Lock()
 
 def _ts() -> str:
-    """Current time in Asia/Jakarta as HH:MM:SS string."""
+    """Current time in Asia/Jakarta as HH:MM:SS."""
     return datetime.datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
 
-def _write(path: str, line: str):
-    """Append one line to a log file (thread-safe, cross-worker)."""
-    with _LOG_FILE_LOCK:
+def _ts_full() -> str:
+    """Full timestamp for sheet rows: YYYY-MM-DD HH:MM:SS."""
+    return datetime.datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S")
+
+def _get_log_tab() -> str:
+    """Return today's sheet tab name (Jakarta date): YYYY-MM-DD."""
+    return datetime.datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%Y-%m-%d")
+
+def _ensure_log_tab(sheets_svc, tab_name: str):
+    """Create the daily tab with a header row if it doesn't exist yet.
+    Uses an in-process cache so the API is only called once per tab per run."""
+    with _CREATED_LOG_TABS_LOCK:
+        if tab_name in _CREATED_LOG_TABS:
+            return
+    try:
+        sheets_svc.spreadsheets().batchUpdate(
+            spreadsheetId=LOG_SPREADSHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]},
+        ).execute()
+        # Write header row into the new tab
+        sheets_svc.spreadsheets().values().update(
+            spreadsheetId=LOG_SPREADSHEET_ID,
+            range=f"'{tab_name}'!A1:B1",
+            valueInputOption="RAW",
+            body={"values": [["Timestamp", "Log"]]},
+        ).execute()
+    except Exception:
+        pass  # Tab already exists — that's fine
+    with _CREATED_LOG_TABS_LOCK:
+        _CREATED_LOG_TABS.add(tab_name)
+
+# ── bot_all.log writer ──────────────────────────────────────────
+def _buf_all(line: str):
+    """Append to the full log file (browser /logs). Thread-safe."""
+    with _ALL_LOG_LOCK:
         try:
-            with open(path, "a", encoding="utf-8") as f:
+            with open(_ALL_LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except Exception:
             pass
 
-def _buf_all(line: str):
-    """Write to the full log (browser /logs)."""
-    _write(_ALL_LOG_FILE, line)
+# ── Google Sheet queue writer ────────────────────────────────────
+def _buf_sheet(line: str):
+    """Queue one row for the daily BotLogs Google Sheet tab."""
+    with _SHEET_QUEUE_LOCK:
+        _SHEET_QUEUE.append([_ts_full(), line])
 
-def _buf_webhook(line: str):
-    """Write to the filtered log (WhatsApp chatbot)."""
-    _write(_WH_LOG_FILE, line)
+# ── Background flusher ───────────────────────────────────────────
+def _sheet_log_flusher():
+    """Daemon thread: every 5 s flush queued rows to the correct daily tab."""
+    while True:
+        time.sleep(5)
+        with _SHEET_QUEUE_LOCK:
+            if not _SHEET_QUEUE:
+                continue
+            rows = list(_SHEET_QUEUE)
+            _SHEET_QUEUE.clear()
+        try:
+            _, sheets_svc, _ = get_google_services()
+            # Group rows by date so midnight crossover lands in the right tab
+            by_tab = _collections.defaultdict(list)
+            for row in rows:
+                tab = row[0][:10]   # "YYYY-MM-DD" prefix of full timestamp
+                by_tab[tab].append(row)
+            for tab_name, tab_rows in by_tab.items():
+                _ensure_log_tab(sheets_svc, tab_name)
+                sheets_svc.spreadsheets().values().append(
+                    spreadsheetId=LOG_SPREADSHEET_ID,
+                    range=f"'{tab_name}'!A:B",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": tab_rows},
+                ).execute()
+        except Exception:
+            # Put rows back — they will be retried next cycle
+            with _SHEET_QUEUE_LOCK:
+                _SHEET_QUEUE.extendleft(reversed(rows))
 
-# 1. Handler for ALL loggers — goes to bot_all.log only
+threading.Thread(target=_sheet_log_flusher, daemon=True, name="sheet-log-flusher").start()
+
+# ── Logging handlers ─────────────────────────────────────────────
+
+# Handler for ALL loggers → bot_all.log only
 class _AllHandler(logging.Handler):
     def emit(self, record):
         try:
@@ -62,14 +139,14 @@ class _AllHandler(logging.Handler):
         except Exception:
             pass
 
-# 2. Handler for httpx only — goes to BOTH log files
+# Handler for httpx → bot_all.log + Google Sheet
 class _HttpxHandler(logging.Handler):
     def emit(self, record):
         try:
-            msg = self.format(record)
+            msg  = self.format(record)
             line = f"[{_ts()}] {record.levelname} {record.name}: {msg}"
             _buf_all(line)
-            _buf_webhook(line)
+            _buf_sheet(line)
         except Exception:
             pass
 
@@ -81,25 +158,23 @@ _httpx_handler = _HttpxHandler()
 _httpx_handler.setFormatter(logging.Formatter("%(message)s"))
 _httpx_handler.setLevel(logging.INFO)
 
-# Root logger — catches Flask, Werkzeug, APScheduler, etc. → bot_all.log only
+# Root logger → bot_all.log (werkzeug, apscheduler, Flask, etc.)
 logging.getLogger().addHandler(_all_handler)
 logging.getLogger().setLevel(logging.DEBUG)
 
-# Werkzeug + APScheduler → bot_all.log only
 for _lgr_name in ("werkzeug", "apscheduler", "apscheduler.executors.default"):
     _l = logging.getLogger(_lgr_name)
     _l.addHandler(_all_handler)
     _l.setLevel(logging.DEBUG)
 
-# httpx → both log files, at INFO only
+# httpx → both sinks, INFO only
 _httpx_logger = logging.getLogger("httpx")
 _httpx_logger.addHandler(_httpx_handler)
 _httpx_logger.setLevel(logging.INFO)
-_httpx_logger.propagate = False  # prevent double-logging via root
+_httpx_logger.propagate = False   # prevent double-logging via root
 
-# 3. Intercept stdout so print() calls go to bot_all.log only
+# Intercept stdout/stderr → bot_all.log only
 class _TeeStream:
-    """Writes to both the original stream and the full log file."""
     def __init__(self, original):
         self._orig = original
     def write(self, text):
@@ -115,11 +190,13 @@ class _TeeStream:
 sys.stdout = _TeeStream(sys.stdout)
 sys.stderr = _TeeStream(sys.stderr)
 
-def _read_log_file(path: str, n: int) -> str:
-    """Read the last n lines from a log file."""
+# ── Log readers ──────────────────────────────────────────────────
+
+def get_all_logs(n: int = 100) -> str:
+    """Browser /logs: read last n lines from bot_all.log."""
     try:
-        with _LOG_FILE_LOCK:
-            with open(path, "r", encoding="utf-8") as f:
+        with _ALL_LOG_LOCK:
+            with open(_ALL_LOG_FILE, "r", encoding="utf-8") as f:
                 lines = f.readlines()
         recent = [l.rstrip("\n") for l in lines[-n:]]
         return "\n".join(recent) if recent else "No logs yet."
@@ -128,23 +205,37 @@ def _read_log_file(path: str, n: int) -> str:
     except Exception as e:
         return f"Error reading logs: {e}"
 
-def get_recent_logs(n: int = 30) -> str:
-    """WhatsApp chatbot: only httpx INFO + HTTP /webhook."""
-    return _read_log_file(_WH_LOG_FILE, n)
-
-def get_all_logs(n: int = 100) -> str:
-    """Browser /logs: full log including werkzeug, apscheduler, etc."""
-    return _read_log_file(_ALL_LOG_FILE, n)
+def get_recent_logs(n: int = 20) -> str:
+    """WhatsApp chatbot: read last n rows from today's daily tab in LOG_SPREADSHEET_ID."""
+    try:
+        _, sheets_svc, _ = get_google_services()
+        tab_name = _get_log_tab()
+        result = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=LOG_SPREADSHEET_ID,
+            range=f"'{tab_name}'!A:B",
+        ).execute()
+        rows = result.get("values", [])
+        # Skip header row
+        if rows and rows[0][0].lower() in ("timestamp", "time", "ts"):
+            rows = rows[1:]
+        if not rows:
+            return f"No logs yet for {tab_name}."
+        recent = rows[-n:]
+        return "\n".join(
+            f"[{r[0]}] {r[1] if len(r) > 1 else ''}" for r in recent
+        )
+    except Exception as e:
+        return f"Error reading logs from Sheet: {e}"
 
 @app.after_request
 def _log_http(response):
-    """All HTTP → bot_all.log; /webhook only → also bot_webhook.log."""
+    """All HTTP → bot_all.log; /webhook only → also Google Sheet queue."""
     try:
         body = response.get_data(as_text=True)
         line = f"[{_ts()}] HTTP {request.method} {request.path} → {response.status_code} | body: {body[:500]}"
         _buf_all(line)
         if request.path == "/webhook":
-            _buf_webhook(line)
+            _buf_sheet(line)
     except Exception:
         pass
     return response
@@ -185,6 +276,7 @@ TWILIO_SID            = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_TOKEN          = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_SANDBOX_NUMBER = "whatsapp:+14155238886"
 SPREADSHEET_ID        = os.environ["GOOGLE_SHEET_ID"]
+LOG_SPREADSHEET_ID    = os.environ["LOG_SHEET_ID"]       # separate spreadsheet for daily bot logs
 
 SCOPES = [
     "https://www.googleapis.com/auth/calendar",
