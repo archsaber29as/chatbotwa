@@ -22,19 +22,23 @@ app = Flask(__name__)
 # ================================================================
 # IN-MEMORY LOG BUFFER — captures ALL output: print, Flask, Werkzeug, APScheduler
 # ================================================================
-import logging, collections, threading, sys
+import logging, threading, sys
 
-_LOG_BUFFER      = collections.deque(maxlen=300)
-_LOG_BUFFER_LOCK = threading.Lock()
-
-def _buf(line: str):
-    """Append one line to the buffer (thread-safe)."""
-    with _LOG_BUFFER_LOCK:
-        _LOG_BUFFER.append(line)
+_LOG_FILE      = "bot.log"
+_LOG_FILE_LOCK = threading.Lock()
 
 def _ts() -> str:
     """Current time in Asia/Jakarta as HH:MM:SS string."""
     return datetime.datetime.now(pytz.timezone("Asia/Jakarta")).strftime("%H:%M:%S")
+
+def _buf(line: str):
+    """Append one line to the shared log file (thread-safe, cross-worker)."""
+    with _LOG_FILE_LOCK:
+        try:
+            with open(_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
 # 1. Custom logging handler — attaches to every logger
 class _BufHandler(logging.Handler):
@@ -74,9 +78,17 @@ sys.stdout = _TeeStream(sys.stdout)
 sys.stderr = _TeeStream(sys.stderr)
 
 def get_recent_logs(n: int = 30) -> str:
-    with _LOG_BUFFER_LOCK:
-        lines = list(_LOG_BUFFER)[-n:]
-    return "\n".join(lines) if lines else "No logs yet."
+    """Read the last n lines from the shared log file — works across all workers."""
+    try:
+        with _LOG_FILE_LOCK:
+            with open(_LOG_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        recent = [l.rstrip("\n") for l in lines[-n:]]
+        return "\n".join(recent) if recent else "No logs yet."
+    except FileNotFoundError:
+        return "No logs yet."
+    except Exception as e:
+        return f"Error reading logs: {e}"
 
 @app.after_request
 def _log_http(response):

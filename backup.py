@@ -47,17 +47,13 @@ class _BufHandler(logging.Handler):
 
 _buf_handler = _BufHandler()
 _buf_handler.setFormatter(logging.Formatter("%(message)s"))
-_buf_handler.setLevel(logging.DEBUG)
+_buf_handler.setLevel(logging.INFO)
 
-# Attach to root logger — catches Flask, Werkzeug, APScheduler, etc.
-logging.getLogger().addHandler(_buf_handler)
-logging.getLogger().setLevel(logging.DEBUG)
-
-# Explicitly attach to Werkzeug (HTTP request lines) and APScheduler
-for _lgr in ("werkzeug", "apscheduler", "apscheduler.executors.default"):
-    _l = logging.getLogger(_lgr)
-    _l.addHandler(_buf_handler)
-    _l.setLevel(logging.DEBUG)
+# Attach only to httpx at INFO — no root / werkzeug / apscheduler noise
+_httpx_logger = logging.getLogger("httpx")
+_httpx_logger.addHandler(_buf_handler)
+_httpx_logger.setLevel(logging.INFO)
+_httpx_logger.propagate = False  # prevent double-logging via root
 
 # 2. Intercept stdout so print() calls are also captured
 class _TeeStream:
@@ -84,10 +80,11 @@ def get_recent_logs(n: int = 30) -> str:
 
 @app.after_request
 def _log_http(response):
-    """Log every HTTP request + response body into the buffer."""
+    """Log HTTP requests — /webhook path only."""
     try:
-        body = response.get_data(as_text=True)
-        _buf(f"[{_ts()}] HTTP {request.method} {request.path} → {response.status_code} | body: {body[:500]}")
+        if request.path == "/webhook":
+            body = response.get_data(as_text=True)
+            _buf(f"[{_ts()}] HTTP {request.method} {request.path} → {response.status_code} | body: {body[:500]}")
     except Exception:
         pass
     return response
