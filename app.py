@@ -309,9 +309,7 @@ def _groq_complete(system_prompt: str, user_prompt: str, max_tokens: int = 1024,
         print(f"[Groq error] {e} — falling back to Gemini 3.1 Flash Lite")
 
     # --- Fallback: Gemini 3.1 Flash Lite ---
-    full_prompt = (f"{system_prompt}
-
-{user_prompt}" if system_prompt else user_prompt)
+    full_prompt = (f"{system_prompt} {user_prompt}" if system_prompt else user_prompt)
     response = gemini_client.models.generate_content(model=MODEL_FALLBACK, contents=full_prompt)
     return response.text.strip()
 
