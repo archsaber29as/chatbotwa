@@ -107,13 +107,15 @@ def localize_jkt(dt: datetime.datetime) -> datetime.datetime:
 
 # ================================================================
 # MODEL CONFIG
-# MODEL_EMBED      : Gemini Embedding 2    — semantic memory (tetap Gemini)
-# MODEL_BRAINSTORM : Gemini 3 Flash        — brainstorming & creative tasks (tetap Gemini)
-# MODEL_GROQ       : Groq Llama 3.1 8B    — classifier, main chat, semua parser
+# MODEL_EMBED      : Gemini Embedding 2      — semantic memory (tetap Gemini)
+# MODEL_BRAINSTORM : Gemini 3 Flash          — brainstorming & creative tasks (tetap Gemini)
+# MODEL_GROQ       : Groq Llama 3.1 8B      — classifier, main chat, semua parser (primary)
+# MODEL_FALLBACK   : Gemini 3.1 Flash Lite  — fallback jika Groq error/unavailable
 # ================================================================
-MODEL_EMBED      = "gemini-embedding-2-preview"   # Gemini Embedding 2 — semantic memory
-MODEL_BRAINSTORM = "gemini-3-flash-preview"        # Gemini 3 Flash     — brainstorming
-MODEL_GROQ       = "llama-3.1-8b-instant"          # Groq               — classifier, main chat, parser
+MODEL_EMBED      = "gemini-embedding-2-preview"      # Gemini Embedding 2    — semantic memory
+MODEL_BRAINSTORM = "gemini-3-flash-preview"           # Gemini 3 Flash        — brainstorming
+MODEL_GROQ       = "llama-3.1-8b-instant"             # Groq                  — primary (classifier, chat, parser)
+MODEL_FALLBACK   = "gemini-3.1-flash-lite-preview"    # Gemini 3.1 Flash Lite — fallback jika Groq down/401
 
 # ================================================================
 # CLIENT & ENV CONFIG
@@ -285,22 +287,33 @@ def _memory_context_block(query: str, min_score: float = 0.50) -> str:
     return "\n\nRelevant from your notes & ideas:\n" + "\n".join(items)
 
 # ================================================================
-# GROQ HELPER — wrapper untuk semua Groq text completion calls
+# GROQ HELPER — wrapper dengan fallback ke Gemini 3.1 Flash Lite
 # ================================================================
 def _groq_complete(system_prompt: str, user_prompt: str, max_tokens: int = 1024, temperature: float = 0.7) -> str:
-    """Call Groq llama-3.1-8b-instant and return the text response."""
+    """Call Groq llama-3.1-8b-instant. Jika gagal (401/rate limit/error), fallback ke Gemini 3.1 Flash Lite."""
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": user_prompt})
 
-    response = groq_client.chat.completions.create(
-        model=MODEL_GROQ,
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
-    return response.choices[0].message.content.strip()
+    # --- Primary: Groq ---
+    try:
+        response = groq_client.chat.completions.create(
+            model=MODEL_GROQ,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[Groq error] {e} — falling back to Gemini 3.1 Flash Lite")
+
+    # --- Fallback: Gemini 3.1 Flash Lite ---
+    full_prompt = (f"{system_prompt}
+
+{user_prompt}" if system_prompt else user_prompt)
+    response = gemini_client.models.generate_content(model=MODEL_FALLBACK, contents=full_prompt)
+    return response.text.strip()
 
 # ================================================================
 # DATE PARSER — menggunakan Groq
