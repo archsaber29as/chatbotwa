@@ -646,28 +646,98 @@ def ai_chat(user_input: str) -> str:
         return "⚠️ Something went wrong. Please try again."
 
 # ================================================================
-# DAILY QUOTE — AI-generated motivational/inspirational quotes
+# DAILY QUOTE — API Ninjas quotes, tailored by Groq
 # ================================================================
-_QUOTE_SYSTEM = (
-    "You are an inspiring life coach who delivers one powerful quote per message. "
-    "The quote should feel personal, warm, and relevant to everyday life. "
-    "Keep it short (1-3 sentences). Add a fitting emoji at the start. "
-    "Vary the theme each time: motivation, mindfulness, productivity, gratitude, growth, etc."
+API_NINJAS_KEY = os.environ["API_NINJAS_KEY"]
+
+# Category map: user hint → API Ninjas category
+_QUOTE_CATEGORY_MAP = {
+    "motivat": "inspirational",
+    "inspir":  "inspirational",
+    "success": "success",
+    "sukses":  "success",
+    "life":    "life",
+    "hidup":   "life",
+    "happi":   "happiness",
+    "bahagia": "happiness",
+    "love":    "love",
+    "cinta":   "love",
+    "wisdom":  "wisdom",
+    "bijak":   "wisdom",
+    "work":    "work",
+    "kerja":   "work",
+    "friend":  "friendship",
+    "teman":   "friendship",
+    "morning": "morning",
+    "pagi":    "morning",
+    "humour":  "humor",
+    "humor":   "humor",
+    "funny":   "humor",
+    "fear":    "courage",
+    "brave":   "courage",
+    "berani":  "courage",
+}
+
+_TAILOR_SYSTEM = (
+    "You are a warm, personal WhatsApp assistant. "
+    "You receive a real quote from a famous person and your job is to present it beautifully. "
+    "Add one relevant emoji at the very start. "
+    "After the quote and attribution, add a short (1-2 sentence) personal reflection or why this quote matters today. "
+    "Keep the reflection conversational and genuine — like a friend sharing something meaningful."
 )
 
-def generate_daily_quote(context: str = "") -> str:
-    """Generate a motivational quote using Groq. Optionally themed by context."""
-    prompt = (
-        f"Give me one unique, meaningful quote for today."
-        + (f" Theme or context: {context}." if context else "")
-        + " Reply with the quote only — no title, no label, no explanation."
-    )
+def _fetch_ninja_quote(category: str = "") -> dict | None:
+    """Fetch one quote from API Ninjas. Returns dict with 'quote' and 'author', or None on failure."""
     try:
-        quote = _groq_complete(_QUOTE_SYSTEM, prompt, max_tokens=128, temperature=0.9)
-        return f"✨ *Quote of the moment*\n\n{quote}"
+        url    = "https://api.api-ninjas.com/v1/quotes"
+        params = {"category": category} if category else {}
+        resp   = requests.get(url, headers={"X-Api-Key": API_NINJAS_KEY}, params=params, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        if data:
+            return data[0]  # {"quote": "...", "author": "...", "category": "..."}
     except Exception as e:
-        print(f"[Quote error] {e}")
+        print(f"[API Ninjas quote error] {e}")
+    return None
+
+def _pick_category(context: str) -> str:
+    """Map a user context string to an API Ninjas category."""
+    lower = context.lower()
+    for keyword, category in _QUOTE_CATEGORY_MAP.items():
+        if keyword in lower:
+            return category
+    return "inspirational"  # sensible default
+
+def generate_daily_quote(context: str = "") -> str:
+    """Fetch a real quote from API Ninjas, then tailor it with Groq."""
+    category = _pick_category(context) if context else "inspirational"
+    raw = _fetch_ninja_quote(category)
+
+    # Fallback: try without category if first attempt failed
+    if not raw:
+        raw = _fetch_ninja_quote()
+
+    if not raw:
         return "✨ *Keep going — every step forward counts, no matter how small.*"
+
+    quote  = raw.get("quote", "")
+    author = raw.get("author", "Unknown")
+
+    prompt = (
+        f'Here is a quote by {author}:\n"{quote}"\n\n'
+        f"Present this quote for a WhatsApp message. "
+        f"Format: emoji + the quote in italics (wrap in _underscores_) + attribution on the next line, "
+        f"then your short personal reflection on a new line."
+        + (f"\n\nContext/theme requested by the user: {context}." if context else "")
+    )
+
+    try:
+        tailored = _groq_complete(_TAILOR_SYSTEM, prompt, max_tokens=200, temperature=0.75)
+        return f"✨ *Quote of the moment*\n\n{tailored}"
+    except Exception as e:
+        print(f"[Quote tailor error] {e}")
+        # Return plain quote if Groq fails
+        return f'✨ *Quote of the moment*\n\n_{quote}_\n— {author}'
 
 def _send_scheduled_quote(label: str):
     """Send an auto-scheduled quote to YOUR_NUMBER via Twilio."""
@@ -677,7 +747,7 @@ def _send_scheduled_quote(label: str):
         twilio_client.messages.create(
             from_=TWILIO_SANDBOX_NUMBER,
             to=YOUR_NUMBER,
-            body=f"🌅 *{label}*\n\n{body}"
+            body=f"{label}\n\n{body}"
         )
         print(f"[Quote scheduler] {label} quote sent successfully.")
     except Exception as e:

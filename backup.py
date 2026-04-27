@@ -516,6 +516,7 @@ Classify the user's message into exactly ONE of these intents:
   get_events    — VIEW, check, look up, or list existing calendar events
   search_memory — ask about something that might be in their notes/ideas
   show_logs     — show recent bot logs or errors
+  quote         — ask for a motivational/inspirational quote (e.g. "give me a quote", "motivate me", "quote of the day", "inspire me")
   chat          — general conversation or anything else
 
 KEY DISAMBIGUATION RULES (apply these before classifying):
@@ -643,6 +644,44 @@ def ai_chat(user_input: str) -> str:
         if "429" in err or "rate_limit" in err.lower():
             return "⚠️ API quota reached. Try again later."
         return "⚠️ Something went wrong. Please try again."
+
+# ================================================================
+# DAILY QUOTE — AI-generated motivational/inspirational quotes
+# ================================================================
+_QUOTE_SYSTEM = (
+    "You are an inspiring life coach who delivers one powerful quote per message. "
+    "The quote should feel personal, warm, and relevant to everyday life. "
+    "Keep it short (1-3 sentences). Add a fitting emoji at the start. "
+    "Vary the theme each time: motivation, mindfulness, productivity, gratitude, growth, etc."
+)
+
+def generate_daily_quote(context: str = "") -> str:
+    """Generate a motivational quote using Groq. Optionally themed by context."""
+    prompt = (
+        f"Give me one unique, meaningful quote for today."
+        + (f" Theme or context: {context}." if context else "")
+        + " Reply with the quote only — no title, no label, no explanation."
+    )
+    try:
+        quote = _groq_complete(_QUOTE_SYSTEM, prompt, max_tokens=128, temperature=0.9)
+        return f"✨ *Quote of the moment*\n\n{quote}"
+    except Exception as e:
+        print(f"[Quote error] {e}")
+        return "✨ *Keep going — every step forward counts, no matter how small.*"
+
+def _send_scheduled_quote(label: str):
+    """Send an auto-scheduled quote to YOUR_NUMBER via Twilio."""
+    try:
+        body = generate_daily_quote()
+        twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
+        twilio_client.messages.create(
+            from_=TWILIO_SANDBOX_NUMBER,
+            to=YOUR_NUMBER,
+            body=f"🌅 *{label}*\n\n{body}"
+        )
+        print(f"[Quote scheduler] {label} quote sent successfully.")
+    except Exception as e:
+        print(f"[Quote scheduler] Failed to send {label} quote: {e}")
 
 # ================================================================
 # REMINDER → Google Calendar
@@ -1111,8 +1150,24 @@ def check_and_send_reminders():
         conn.commit()
     conn.close()
 
-scheduler = BackgroundScheduler()
+scheduler = BackgroundScheduler(timezone=TZ_JKT)
 scheduler.add_job(check_and_send_reminders, "interval", minutes=1)
+
+# ── Daily quote jobs (Jakarta time) ─────────────────────────────
+scheduler.add_job(
+    _send_scheduled_quote,
+    "cron",
+    hour=6, minute=0,
+    args=["Good Morning 🌅"],
+    id="morning_quote"
+)
+scheduler.add_job(
+    _send_scheduled_quote,
+    "cron",
+    hour=23, minute=0,
+    args=["Good Night 🌙"],
+    id="night_quote"
+)
 scheduler.start()
 
 # ================================================================
@@ -1243,6 +1298,14 @@ def webhook():
             msg.body("🔍 *Found in your memory:*\n\n" + "\n".join(items))
         else:
             msg.body("🔍 Nothing relevant found in your notes or ideas.")
+
+    elif intent == "quote":
+        # Extract optional theme/context from the message
+        context = re.sub(
+            r"quote|motivate me|inspire me|motivasi|inspirasi|give me a|berikan|kasih",
+            "", lower
+        ).strip(" :?!")
+        msg.body(generate_daily_quote(context))
 
     else:  # chat — Groq Llama 3.1 8B with memory context
         msg.body(ai_chat(incoming))
