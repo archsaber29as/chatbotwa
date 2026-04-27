@@ -689,7 +689,7 @@ _TAILOR_SYSTEM = (
 def _fetch_ninja_quote(category: str = "") -> dict | None:
     """Fetch one quote from API Ninjas. Returns dict with 'quote' and 'author', or None on failure."""
     try:
-        url    = "https://api.api-ninjas.com/v1/quotes"
+        url    = "https://api.api-ninjas.com/v2/randomquotes"
         params = {"category": category} if category else {}
         resp   = requests.get(url, headers={"X-Api-Key": API_NINJAS_KEY}, params=params, timeout=5)
         resp.raise_for_status()
