@@ -727,7 +727,6 @@ def generate_daily_quote(context: str = "") -> str:
         f'Here is a quote by {author}:\n"{quote}"\n\n'
         f"Present this quote for a WhatsApp message. "
         f"Format: the quote in italics (wrap in _underscores_) + attribution on the next line, "
-        f"then your short personal reflection on a new line."
         + (f"\n\nContext/theme requested by the user: {context}." if context else "")
     )
 
