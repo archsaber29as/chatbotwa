@@ -515,7 +515,6 @@ Classify the user's message into exactly ONE of these intents:
   add_event     — CREATE / add a new calendar event
   get_events    — VIEW, check, look up, or list existing calendar events
   search_memory — ask about something that might be in their notes/ideas
-  show_logs     — show recent bot logs or errors
   quote         — ask for a motivational/inspirational quote (e.g. "give me a quote", "motivate me", "quote of the day", "inspire me")
   chat          — general conversation or anything else
 
@@ -1325,17 +1324,6 @@ def webhook():
                 "Try: *Add event Team lunch on April 22 at 1pm*\n"
                 "Or: *New event Meeting tomorrow at 3pm for 2 hours*"
             )
-    elif intent == "show_logs":
-        n = 20
-        try:
-            # allow "show last 50 logs" etc.
-            nums = re.findall(r"\d+", incoming)
-            if nums:
-                n = min(int(nums[0]), 50)
-        except Exception:
-            pass
-        logs = get_recent_logs(n)
-        msg.body(f"🖥️ *Last {n} log lines:*\n\n```\n{logs}\n```")
 
     elif intent == "search_memory":
         # Gemini Embedding 2: semantic search through notes & ideas
