@@ -625,7 +625,7 @@ Classify the user's message into exactly ONE of these intents:
   get_events    — VIEW, check, look up, or list existing calendar events
   search_memory — ask about something that might be in their notes/ideas
   quote         — ask for a motivational/inspirational quote (e.g. "give me a quote", "motivate me", "quote of the day", "inspire me")
-  budget        — calculate daily budget / sisa uang / berapa sisa per hari / budget harian / survive until payday / kalkulasi budget / hitung uang sisa
+  budget        — CALCULATE or COMPUTE a budget with actual numbers: user provides a specific monetary amount and wants to know how much they can spend per day / sisa uang / berapa sisa per hari / survive until payday / kalkulasi budget / hitung uang sisa. Requires a specific monetary figure or explicit calculation request.
   chat          — general conversation or anything else
 
 KEY DISAMBIGUATION RULES (apply these before classifying):
@@ -636,6 +636,8 @@ KEY DISAMBIGUATION RULES (apply these before classifying):
 - "add event X" / "schedule X" / "create event X" / "new event X" → add_event
 - "show my reminders" / "list reminders" / "what are my reminders" → get_reminders
 - The word "remind" alone does NOT mean intent=reminder. Look at the full sentence structure.
+- "how to budget" / "tips for budgeting" / "how to spend daily budget wisely" / any advice or how-to question about money → chat (NOT budget). The budget intent requires actual numbers to calculate, not general advice.
+- "how to spend my daily budget wisely?" → chat (advice question, no number to calculate)
 
 Reply ONLY with a JSON object (no markdown, no preamble):
 {{"intent": "<intent>", "params": {{"content": "<extracted content if any>", "keyword": "<keyword if applicable>", "date": "<date if mentioned, e.g. 2025-05-10>"}}}}
@@ -1570,15 +1572,14 @@ def webhook():
     _touch_last_active()
 
     # Step 0c: Hard-coded keyword shortcuts — never go through AI classifier
-    _log_triggers = {"show logs", "show log", "lihat log", "cek log", "log error",
-                     "logs", "/logs", "show errors", "bot status", "status bot"}
-    if any(t in lower for t in _log_triggers):
+    # Only trigger on explicit /logs command to avoid false positives.
+    if lower.startswith("/logs"):
         n = 20
         nums = re.findall(r"\d+", incoming)
         if nums:
             n = min(int(nums[0]), 50)
         logs = get_recent_logs(n)
-        logs_truncated = logs[-1400:]  # Take only the LAST 1400 chars
+        logs_truncated = logs[-1400:]
         msg.body(f"🖥️ *Last {n} log lines:*\n\n{logs_truncated}")
         return str(resp)
 
