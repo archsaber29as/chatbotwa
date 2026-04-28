@@ -515,7 +515,6 @@ Classify the user's message into exactly ONE of these intents:
   add_event     — CREATE / add a new calendar event
   get_events    — VIEW, check, look up, or list existing calendar events
   search_memory — ask about something that might be in their notes/ideas
-  show_logs     — show recent bot logs or errors
   quote         — ask for a motivational/inspirational quote (e.g. "give me a quote", "motivate me", "quote of the day", "inspire me")
   chat          — general conversation or anything else
 
@@ -678,13 +677,7 @@ _QUOTE_CATEGORY_MAP = {
     "berani":  "courage",
 }
 
-_TAILOR_SYSTEM = (
-    "You are a warm, personal WhatsApp assistant. "
-    "You receive a real quote from a famous person and your job is to present it beautifully. "
-    "Add one relevant emoji at the very start. "
-    "After the quote and attribution, add a short (1-2 sentence) personal reflection or why this quote matters today. "
-    "Keep the reflection conversational and genuine — like a friend sharing something meaningful."
-)
+
 
 def _fetch_ninja_quote(category: str = "") -> dict | None:
     """Fetch one quote from API Ninjas. Returns dict with 'quote' and 'author', or None on failure."""
@@ -709,7 +702,7 @@ def _pick_category(context: str) -> str:
     return "inspirational"  # sensible default
 
 def generate_daily_quote(context: str = "") -> str:
-    """Fetch a real quote from API Ninjas, then tailor it with Groq."""
+    """Fetch a quote from API Ninjas and return it cleanly formatted."""
     category = _pick_category(context) if context else "inspirational"
     raw = _fetch_ninja_quote(category)
 
@@ -718,25 +711,12 @@ def generate_daily_quote(context: str = "") -> str:
         raw = _fetch_ninja_quote()
 
     if not raw:
-        return "✨ *Keep going — every step forward counts, no matter how small.*"
+        return "*Keep going — every step forward counts, no matter how small.*"
 
     quote  = raw.get("quote", "")
     author = raw.get("author", "Unknown")
 
-    prompt = (
-        f'Here is a quote by {author}:\n"{quote}"\n\n'
-        f"Present this quote for a WhatsApp message. "
-        f"Format: the quote in italics (wrap in _underscores_) + attribution on the next line, "
-        + (f"\n\nContext/theme requested by the user: {context}." if context else "")
-    )
-
-    try:
-        tailored = _groq_complete(_TAILOR_SYSTEM, prompt, max_tokens=200, temperature=0.75)
-        return f"✨ *Quote of the moment*\n\n{tailored}"
-    except Exception as e:
-        print(f"[Quote tailor error] {e}")
-        # Return plain quote if Groq fails
-        return f'✨ *Quote of the moment*\n\n_{quote}_\n— {author}'
+    return f"_{quote}_\n{author}"
 
 def _send_scheduled_quote(label: str):
     """Send an auto-scheduled quote to YOUR_NUMBER via Twilio."""
@@ -746,7 +726,7 @@ def _send_scheduled_quote(label: str):
         twilio_client.messages.create(
             from_=TWILIO_SANDBOX_NUMBER,
             to=YOUR_NUMBER,
-            body=f"{label}\n\n{body}"
+            body=body
         )
         print(f"[Quote scheduler] {label} quote sent successfully.")
     except Exception as e:
@@ -1344,17 +1324,6 @@ def webhook():
                 "Try: *Add event Team lunch on April 22 at 1pm*\n"
                 "Or: *New event Meeting tomorrow at 3pm for 2 hours*"
             )
-    elif intent == "show_logs":
-        n = 20
-        try:
-            # allow "show last 50 logs" etc.
-            nums = re.findall(r"\d+", incoming)
-            if nums:
-                n = min(int(nums[0]), 50)
-        except Exception:
-            pass
-        logs = get_recent_logs(n)
-        msg.body(f"🖥️ *Last {n} log lines:*\n\n```\n{logs}\n```")
 
     elif intent == "search_memory":
         # Gemini Embedding 2: semantic search through notes & ideas
@@ -1417,4 +1386,4 @@ def logs_endpoint():
     return html, 200, {"Content-Type": "text/html"}
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", debug=True,port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", debug=True, use_reloader=False,port=int(os.environ.get("PORT", 5000)))

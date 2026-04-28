@@ -516,6 +516,7 @@ Classify the user's message into exactly ONE of these intents:
   get_events    — VIEW, check, look up, or list existing calendar events
   search_memory — ask about something that might be in their notes/ideas
   quote         — ask for a motivational/inspirational quote (e.g. "give me a quote", "motivate me", "quote of the day", "inspire me")
+  budget        — calculate daily budget / sisa uang / berapa sisa per hari / budget harian / survive until payday / kalkulasi budget / hitung uang sisa (user wants to know how much they can spend per day until the 25th payroll date)
   chat          — general conversation or anything else
 
 KEY DISAMBIGUATION RULES (apply these before classifying):
@@ -1220,6 +1221,206 @@ scheduler.add_job(
 scheduler.start()
 
 # ================================================================
+# BUDGET CALCULATOR — daily survival calculator until payroll (25th)
+# ================================================================
+
+# Fixed monthly expenses: (name, amount, due_day or None for conditional)
+FIXED_EXPENSES = [
+    {"name": "House Rent",        "amount": 955_000,  "due_day": 25},
+    {"name": "Internet",          "amount": 150_000,  "due_day": None},   # conditional
+    {"name": "Zakat",             "amount": 250_000,  "due_day": 25},     # often 25th
+    {"name": "House Maintenance", "amount": 600_000,  "due_day": 9},
+]
+
+# Variable monthly budgets: (name, total_budget)
+VARIABLE_BUDGETS = [
+    {"name": "Ticket to go home", "budget": 600_000},
+    {"name": "Fuel",              "budget": 70_000},
+    {"name": "Laundry",          "budget": 60_000},
+]
+
+PAYROLL_DAY = 25   # day of month salary arrives
+
+
+def _parse_budget_input(user_input: str) -> dict | None:
+    """Use Groq to extract budget calculator parameters from natural language."""
+    now   = now_jkt()
+    today = now.day
+    month = now.strftime("%B")
+    year  = now.year
+
+    # Build a description of known expenses for context
+    fixed_names    = ", ".join(e["name"] for e in FIXED_EXPENSES)
+    variable_names = ", ".join(v["name"] for v in VARIABLE_BUDGETS)
+
+    prompt = f"""You are a budget parser for a personal finance chatbot. Today is the {today}th of {month} {year}.
+
+The user has these fixed monthly expenses: {fixed_names}
+The user has these variable monthly budgets: {variable_names}
+
+Extract the following from the user's message:
+1. "remaining_money": total money they have right now (integer, in IDR)
+2. "paid_fixed": list of fixed expense names already paid this month (from the fixed list above)
+3. "spent_variable": dict of variable budget name → amount already spent (from the variable list above)
+4. "pending_conditional": list of conditional expense names still expected this month (e.g. "Internet" if not yet paid)
+
+If a value is not mentioned, omit it or use null.
+
+Reply ONLY with a valid JSON object, no markdown, no explanation:
+{{"remaining_money": <int or null>, "paid_fixed": [<names>], "spent_variable": {{"<name>": <amount>}}, "pending_conditional": [<names>]}}
+
+User message: {user_input}"""
+
+    try:
+        raw = _groq_complete(
+            system_prompt="You are a budget parser. Reply with valid JSON only.",
+            user_prompt=prompt,
+            max_tokens=300,
+            temperature=0.0,
+        )
+        raw = re.sub(r"```json|```", "", raw).strip()
+        return json.loads(raw)
+    except Exception as e:
+        print(f"[Budget parse error] {e}")
+        return None
+
+
+def _budget_interactive_prompt() -> str:
+    """Return an interactive step-by-step prompt when user triggers budget without enough info."""
+    now     = now_jkt()
+    today   = now.day
+    days_left = (PAYROLL_DAY - today) if today < PAYROLL_DAY else (
+        (PAYROLL_DAY + (31 - today))  # rough next month estimate
+    )
+
+    lines = [
+        f"💰 *Budget Calculator* — {days_left} days until payday (25th)\n",
+        "Please tell me:",
+        "1️⃣ How much money do you have right now?",
+        "2️⃣ Which fixed expenses have you already paid?",
+        f"   Options: {', '.join(e['name'] for e in FIXED_EXPENSES)}",
+        "3️⃣ How much have you spent from variable budgets?",
+        f"   Options: {', '.join(v['name'] for v in VARIABLE_BUDGETS)}",
+        "4️⃣ Any conditional expenses still pending? (e.g. Internet)",
+        "",
+        "💡 *Example:*",
+        "\"I have 2.500.000. Already paid: Rent, Zakat, House Maintenance.",
+        "Spent: Ticket 300k, Fuel 35k, Laundry 35k. Internet still pending.\"",
+    ]
+    return "\n".join(lines)
+
+
+def calculate_budget(user_input: str) -> str:
+    """Parse natural language budget input and return daily survival budget."""
+    now   = now_jkt()
+    today = now.day
+
+    # Days remaining until 25th payroll
+    if today <= PAYROLL_DAY:
+        days_left = PAYROLL_DAY - today
+    else:
+        # Already past 25th, count to next month's 25th
+        import calendar
+        days_in_month = calendar.monthrange(now.year, now.month)[1]
+        days_left = (days_in_month - today) + PAYROLL_DAY
+
+    # If user just said "budget" or "hitung budget" with no data, guide them
+    bare_triggers = {"budget", "hitung budget", "kalkulasi budget", "budget calculator",
+                     "budget harian", "sisa budget", "budget check"}
+    if user_input.strip().lower() in bare_triggers:
+        return _budget_interactive_prompt()
+
+    # Try to parse the input
+    parsed = _parse_budget_input(user_input)
+    if not parsed or parsed.get("remaining_money") is None:
+        return _budget_interactive_prompt()
+
+    remaining      = parsed.get("remaining_money", 0)
+    paid_fixed     = [n.lower() for n in (parsed.get("paid_fixed") or [])]
+    spent_variable = {k.lower(): v for k, v in (parsed.get("spent_variable") or {}).items()}
+    pending_cond   = [n.lower() for n in (parsed.get("pending_conditional") or [])]
+
+    # Calculate still-owed fixed expenses
+    still_owed = []
+    for exp in FIXED_EXPENSES:
+        name_lower = exp["name"].lower()
+        already_paid = any(name_lower in p or p in name_lower for p in paid_fixed)
+        if already_paid:
+            continue
+        # Skip non-conditional ones that are past their due date and not yet paid
+        # (they may have been paid but user forgot to mention — include them to be safe)
+        still_owed.append(exp)
+
+    # Calculate remaining variable budgets
+    remaining_var = []
+    for var in VARIABLE_BUDGETS:
+        name_lower = var["name"].lower()
+        spent = 0
+        for k, v in spent_variable.items():
+            if name_lower in k or k in name_lower:
+                spent = v
+                break
+        leftover = var["budget"] - spent
+        if leftover > 0:
+            remaining_var.append({"name": var["name"], "remaining": leftover, "spent": spent})
+
+    # Also include pending conditional expenses as deductions
+    pending_amounts = []
+    for exp in FIXED_EXPENSES:
+        name_lower = exp["name"].lower()
+        if any(name_lower in p or p in name_lower for p in pending_cond):
+            # Only if not already in still_owed
+            if not any(e["name"].lower() == name_lower for e in still_owed):
+                pending_amounts.append(exp)
+
+    total_still_owed   = sum(e["amount"] for e in still_owed) + sum(e["amount"] for e in pending_amounts)
+    total_var_remaining = sum(v["remaining"] for v in remaining_var)
+    total_deductions   = total_still_owed + total_var_remaining
+    free_money         = remaining - total_deductions
+    daily_budget       = free_money / days_left if days_left > 0 else free_money
+
+    # Format the output
+    def fmt(n): return f"Rp {int(n):,}".replace(",", ".")
+
+    lines = [f"💰 *Budget Breakdown* — {days_left} days to payday (25th)\n"]
+    lines.append(f"💵 Current money: *{fmt(remaining)}*\n")
+
+    if still_owed or pending_amounts:
+        lines.append("📋 *Fixed expenses still to pay:*")
+        for e in still_owed:
+            lines.append(f"  • {e['name']}: {fmt(e['amount'])}")
+        for e in pending_amounts:
+            lines.append(f"  • {e['name']} (pending): {fmt(e['amount'])}")
+        lines.append(f"  ➤ Total: {fmt(total_still_owed)}\n")
+
+    if remaining_var:
+        lines.append("🗂️ *Remaining variable budgets:*")
+        for v in remaining_var:
+            lines.append(f"  • {v['name']}: {fmt(v['remaining'])} (spent {fmt(v['spent'])})")
+        lines.append(f"  ➤ Total: {fmt(total_var_remaining)}\n")
+
+    lines.append(f"📊 *Summary:*")
+    lines.append(f"  Money in hand:      {fmt(remaining)}")
+    lines.append(f"  Total deductions:   -{fmt(total_deductions)}")
+    lines.append(f"  Free money left:    {fmt(free_money)}")
+    lines.append(f"  Days until payday:  {days_left} days\n")
+
+    if daily_budget < 0:
+        lines.append(f"⚠️ *You're short by {fmt(abs(free_money))}!*")
+        lines.append("Consider reducing variable spending.")
+    else:
+        lines.append(f"✅ *Daily budget: {fmt(daily_budget)}/day*")
+        if daily_budget < 50_000:
+            lines.append("⚠️ Tight! Keep non-essentials minimal.")
+        elif daily_budget < 100_000:
+            lines.append("🟡 Manageable. Watch your spending.")
+        else:
+            lines.append("🟢 You're in a comfortable position!")
+
+    return "\n".join(lines)
+
+
+# ================================================================
 # WEBHOOK — AI-powered intent routing
 # ================================================================
 @app.route("/webhook", methods=["POST"])
@@ -1344,6 +1545,9 @@ def webhook():
             "", lower
         ).strip(" :?!")
         msg.body(generate_daily_quote(context))
+
+    elif intent == "budget":
+        msg.body(calculate_budget(incoming))
 
     else:  # chat — Groq Llama 3.1 8B with memory context
         msg.body(ai_chat(incoming))
