@@ -221,9 +221,14 @@ def get_recent_logs(n: int = 20) -> str:
         if not rows:
             return f"No logs yet for {tab_name}."
         recent = rows[-n:]
-        return "\n".join(
-            f"[{r[0]}] {r[1] if len(r) > 1 else ''}" for r in recent
-        )
+        lines = []
+        for r in recent:
+            entry = f"[{r[0]}] {r[1] if len(r) > 1 else ''}"
+            # Strip everything from "| body:" onward — only keep the HTTP status line
+            if "| body:" in entry:
+                entry = entry[:entry.index("| body:")].rstrip()
+            lines.append(entry)
+        return "\n".join(lines)
     except Exception as e:
         return f"Error reading logs from Sheet: {e}"
 
