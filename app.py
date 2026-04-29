@@ -631,6 +631,15 @@ Classify the user's message into exactly ONE of these intents:
   search_memory — ask about something that might be in their notes/ideas
   quote         — ask for a motivational/inspirational quote (e.g. "give me a quote", "motivate me", "quote of the day", "inspire me")
   budget        — CALCULATE or COMPUTE a budget with actual numbers: user provides a specific monetary amount and wants to know how much they can spend per day / sisa uang / berapa sisa per hari / survive until payday / kalkulasi budget / hitung uang sisa. Requires a specific monetary figure or explicit calculation request.
+  delete_note   — DELETE or REMOVE a saved note by number or keyword (e.g. "delete note 2", "hapus note fix the logs")
+  edit_note     — EDIT or UPDATE the content of a saved note (e.g. "edit note 2 to ...", "update note fix to ...")
+  delete_idea   — DELETE or REMOVE a saved idea by number or keyword
+  edit_idea     — EDIT or UPDATE a saved idea
+  delete_task   — DELETE or REMOVE a task (not marking as done, but fully removing it)
+  edit_task     — EDIT or UPDATE a task title
+  delete_event  — DELETE or REMOVE a calendar event by name or keyword (e.g. "delete event Team lunch", "hapus event meeting")
+  edit_event    — EDIT or UPDATE an existing calendar event (title, time, or description)
+  delete_reminder — DELETE or REMOVE a saved reminder by keyword or time
   chat          — general conversation or anything else
 
 KEY DISAMBIGUATION RULES (apply these before classifying):
@@ -643,9 +652,12 @@ KEY DISAMBIGUATION RULES (apply these before classifying):
 - The word "remind" alone does NOT mean intent=reminder. Look at the full sentence structure.
 - "how to budget" / "tips for budgeting" / "how to spend daily budget wisely" / any advice or how-to question about money → chat (NOT budget). The budget intent requires actual numbers to calculate, not general advice.
 - "how to spend my daily budget wisely?" → chat (advice question, no number to calculate)
+- "delete/remove/hapus note/idea/task/event/reminder X" → delete_* intent (not complete_task)
+- "edit/update/change/ubah note/idea/task/event/reminder X to/with Y" → edit_* intent
+- "delete task X" → delete_task (permanently remove), NOT complete_task (which marks done)
 
 Reply ONLY with a JSON object (no markdown, no preamble):
-{{"intent": "<intent>", "params": {{"content": "<extracted content if any>", "keyword": "<keyword if applicable>", "date": "<date if mentioned, e.g. 2025-05-10>"}}}}
+{{"intent": "<intent>", "params": {{"content": "<new content for edit intents>", "keyword": "<item to find/delete/edit>", "index": "<item number if user said e.g. note 2>", "date": "<date if mentioned, e.g. 2025-05-10>"}}}}
 
 User message: {message}"""
 
@@ -1534,6 +1546,377 @@ def calculate_budget(user_input: str) -> str:
 
 
 # ================================================================
+
+# ================================================================
+# DELETE / EDIT — Notes
+# ================================================================
+def delete_note(keyword: str = None, index: int = None) -> str:
+    try:
+        _, sheets_svc, _ = get_google_services()
+        result = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID, range="Notes!A:B"
+        ).execute()
+        rows = result.get("values", [])
+        data_rows = [r for r in rows if len(r) >= 2]  # skip empty
+        if not data_rows:
+            return "📝 No notes to delete."
+
+        # Find target row
+        target_i = None
+        if index is not None:
+            i = int(index) - 1
+            if 0 <= i < len(data_rows):
+                target_i = i
+        elif keyword:
+            for i, r in enumerate(data_rows):
+                if keyword.lower() in r[1].lower():
+                    target_i = i
+                    break
+
+        if target_i is None:
+            return f"❌ Note not found. Use *get notes* to see your list, then refer by number or keyword."
+
+        deleted_text = data_rows[target_i][1]
+        # Sheet row index (1-based, +1 for header if exists)
+        header_offset = 1 if rows and rows[0][0].lower() in ("timestamp", "time", "ts", "a") else 0
+        sheet_row = target_i + 1 + header_offset  # 1-based
+
+        sheet_id = sheets_svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        notes_sheet_id = next((s["properties"]["sheetId"] for s in sheet_id["sheets"] if s["properties"]["title"] == "Notes"), None)
+        sheets_svc.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"requests": [{"deleteDimension": {"range": {
+                "sheetId": notes_sheet_id, "dimension": "ROWS",
+                "startIndex": sheet_row - 1, "endIndex": sheet_row
+            }}}]}
+        ).execute()
+
+        # Also delete from SQLite
+        conn = sqlite3.connect("bot.db")
+        conn.execute("DELETE FROM notes WHERE content = ?", (deleted_text,))
+        conn.commit(); conn.close()
+        return f"🗑️ Note deleted: _{deleted_text[:60]}_"
+    except Exception as e:
+        return f"⚠️ Could not delete note: {e}"
+
+
+def edit_note(new_content: str, keyword: str = None, index: int = None) -> str:
+    try:
+        _, sheets_svc, _ = get_google_services()
+        result = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID, range="Notes!A:B"
+        ).execute()
+        rows = result.get("values", [])
+        data_rows = [r for r in rows if len(r) >= 2]
+        if not data_rows:
+            return "📝 No notes to edit."
+
+        target_i = None
+        if index is not None:
+            i = int(index) - 1
+            if 0 <= i < len(data_rows):
+                target_i = i
+        elif keyword:
+            for i, r in enumerate(data_rows):
+                if keyword.lower() in r[1].lower():
+                    target_i = i
+                    break
+
+        if target_i is None:
+            return "❌ Note not found. Use *get notes* to see your list."
+
+        header_offset = 1 if rows and rows[0][0].lower() in ("timestamp", "time", "ts", "a") else 0
+        sheet_row = target_i + 1 + header_offset
+        timestamp = now_jkt().strftime("%Y-%m-%d %H:%M")
+
+        sheets_svc.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Notes!A{sheet_row}:B{sheet_row}",
+            valueInputOption="RAW",
+            body={"values": [[timestamp, new_content]]}
+        ).execute()
+
+        # Sync SQLite
+        old_text = data_rows[target_i][1]
+        conn = sqlite3.connect("bot.db")
+        conn.execute("UPDATE notes SET content=?, timestamp=? WHERE content=?", (new_content, str(now_jkt()), old_text))
+        conn.commit(); conn.close()
+        return f"✏️ Note updated!\n_{new_content[:80]}_"
+    except Exception as e:
+        return f"⚠️ Could not edit note: {e}"
+
+
+# ================================================================
+# DELETE / EDIT — Ideas
+# ================================================================
+def delete_idea(keyword: str = None, index: int = None) -> str:
+    try:
+        _, sheets_svc, _ = get_google_services()
+        result = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID, range="Ideas!A:B"
+        ).execute()
+        rows = result.get("values", [])
+        data_rows = [r for r in rows if len(r) >= 2]
+        if not data_rows:
+            return "💡 No ideas to delete."
+
+        target_i = None
+        if index is not None:
+            i = int(index) - 1
+            if 0 <= i < len(data_rows):
+                target_i = i
+        elif keyword:
+            for i, r in enumerate(data_rows):
+                if keyword.lower() in r[1].lower():
+                    target_i = i
+                    break
+
+        if target_i is None:
+            return "❌ Idea not found. Use *get ideas* to see your list."
+
+        deleted_text = data_rows[target_i][1]
+        header_offset = 1 if rows and rows[0][0].lower() in ("timestamp", "time", "ts", "a") else 0
+        sheet_row = target_i + 1 + header_offset
+
+        sheet_meta = sheets_svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+        ideas_sheet_id = next((s["properties"]["sheetId"] for s in sheet_meta["sheets"] if s["properties"]["title"] == "Ideas"), None)
+        sheets_svc.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"requests": [{"deleteDimension": {"range": {
+                "sheetId": ideas_sheet_id, "dimension": "ROWS",
+                "startIndex": sheet_row - 1, "endIndex": sheet_row
+            }}}]}
+        ).execute()
+
+        conn = sqlite3.connect("bot.db")
+        conn.execute("DELETE FROM ideas WHERE content = ?", (deleted_text,))
+        conn.commit(); conn.close()
+        return f"🗑️ Idea deleted: _{deleted_text[:60]}_"
+    except Exception as e:
+        return f"⚠️ Could not delete idea: {e}"
+
+
+def edit_idea(new_content: str, keyword: str = None, index: int = None) -> str:
+    try:
+        _, sheets_svc, _ = get_google_services()
+        result = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID, range="Ideas!A:B"
+        ).execute()
+        rows = result.get("values", [])
+        data_rows = [r for r in rows if len(r) >= 2]
+        if not data_rows:
+            return "💡 No ideas to edit."
+
+        target_i = None
+        if index is not None:
+            i = int(index) - 1
+            if 0 <= i < len(data_rows):
+                target_i = i
+        elif keyword:
+            for i, r in enumerate(data_rows):
+                if keyword.lower() in r[1].lower():
+                    target_i = i
+                    break
+
+        if target_i is None:
+            return "❌ Idea not found. Use *get ideas* to see your list."
+
+        header_offset = 1 if rows and rows[0][0].lower() in ("timestamp", "time", "ts", "a") else 0
+        sheet_row = target_i + 1 + header_offset
+        timestamp = now_jkt().strftime("%Y-%m-%d %H:%M")
+
+        sheets_svc.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Ideas!A{sheet_row}:B{sheet_row}",
+            valueInputOption="RAW",
+            body={"values": [[timestamp, new_content]]}
+        ).execute()
+
+        old_text = data_rows[target_i][1]
+        conn = sqlite3.connect("bot.db")
+        conn.execute("UPDATE ideas SET content=?, timestamp=? WHERE content=?", (new_content, str(now_jkt()), old_text))
+        conn.commit(); conn.close()
+        return f"✏️ Idea updated!\n_{new_content[:80]}_"
+    except Exception as e:
+        return f"⚠️ Could not edit idea: {e}"
+
+
+# ================================================================
+# DELETE / EDIT — Tasks (Google Tasks)
+# ================================================================
+def delete_task(keyword: str = None, index: int = None) -> str:
+    try:
+        _, _, tasks_svc = get_google_services()
+        result = tasks_svc.tasks().list(tasklist="@default", showCompleted=False).execute()
+        items = result.get("items", [])
+        if not items:
+            return "📋 No tasks to delete."
+
+        target = None
+        if index is not None:
+            i = int(index) - 1
+            if 0 <= i < len(items):
+                target = items[i]
+        elif keyword:
+            for t in items:
+                if keyword.lower() in t["title"].lower():
+                    target = t
+                    break
+
+        if not target:
+            return "❌ Task not found. Use *get tasks* to see your list."
+
+        tasks_svc.tasks().delete(tasklist="@default", task=target["id"]).execute()
+
+        conn = sqlite3.connect("bot.db")
+        conn.execute("DELETE FROM tasks WHERE content = ?", (target["title"],))
+        conn.commit(); conn.close()
+        return f"🗑️ Task deleted: _{target['title']}_"
+    except Exception as e:
+        return f"⚠️ Could not delete task: {e}"
+
+
+def edit_task(new_title: str, keyword: str = None, index: int = None) -> str:
+    try:
+        _, _, tasks_svc = get_google_services()
+        result = tasks_svc.tasks().list(tasklist="@default", showCompleted=False).execute()
+        items = result.get("items", [])
+        if not items:
+            return "📋 No tasks to edit."
+
+        target = None
+        if index is not None:
+            i = int(index) - 1
+            if 0 <= i < len(items):
+                target = items[i]
+        elif keyword:
+            for t in items:
+                if keyword.lower() in t["title"].lower():
+                    target = t
+                    break
+
+        if not target:
+            return "❌ Task not found. Use *get tasks* to see your list."
+
+        tasks_svc.tasks().patch(
+            tasklist="@default", task=target["id"], body={"title": new_title}
+        ).execute()
+
+        old_title = target["title"]
+        conn = sqlite3.connect("bot.db")
+        conn.execute("UPDATE tasks SET content=? WHERE content=?", (new_title, old_title))
+        conn.commit(); conn.close()
+        return f"✏️ Task updated!\n_{new_title}_"
+    except Exception as e:
+        return f"⚠️ Could not edit task: {e}"
+
+
+# ================================================================
+# DELETE / EDIT — Google Calendar Events
+# ================================================================
+def delete_event(keyword: str) -> str:
+    try:
+        calendar_svc, _, _ = get_google_services()
+        now = now_jkt()
+        result = calendar_svc.events().list(
+            calendarId="primary",
+            timeMin=now.isoformat(),
+            maxResults=20,
+            singleEvents=True,
+            orderBy="startTime",
+            q=keyword
+        ).execute()
+        events = result.get("items", [])
+        if not events:
+            return f"❌ No upcoming event found matching '{keyword}'. Use *get events* to check your calendar."
+
+        ev = events[0]
+        calendar_svc.events().delete(calendarId="primary", eventId=ev["id"]).execute()
+        return f"🗑️ Event deleted: _{ev.get('summary', keyword)}_"
+    except Exception as e:
+        return f"⚠️ Could not delete event: {e}"
+
+
+def edit_event(keyword: str, new_title: str = None, new_start: str = None, new_end: str = None, new_description: str = None) -> str:
+    try:
+        calendar_svc, _, _ = get_google_services()
+        now = now_jkt()
+        result = calendar_svc.events().list(
+            calendarId="primary",
+            timeMin=now.isoformat(),
+            maxResults=20,
+            singleEvents=True,
+            orderBy="startTime",
+            q=keyword
+        ).execute()
+        events = result.get("items", [])
+        if not events:
+            return f"❌ No upcoming event found matching '{keyword}'. Use *get events* to check your calendar."
+
+        ev = events[0]
+        body = {}
+        if new_title:
+            body["summary"] = new_title
+        if new_start:
+            dt_start = localize_jkt(datetime.datetime.strptime(new_start, "%Y-%m-%d %H:%M"))
+            body["start"] = {"dateTime": dt_start.isoformat(), "timeZone": "Asia/Jakarta"}
+        if new_end:
+            dt_end = localize_jkt(datetime.datetime.strptime(new_end, "%Y-%m-%d %H:%M"))
+            body["end"] = {"dateTime": dt_end.isoformat(), "timeZone": "Asia/Jakarta"}
+        if new_description:
+            body["description"] = new_description
+
+        if not body:
+            return "⚠️ Nothing to update. Specify a new title, time, or description."
+
+        calendar_svc.events().patch(calendarId="primary", eventId=ev["id"], body=body).execute()
+        old_title = ev.get("summary", keyword)
+        return f"✏️ Event _{old_title}_ updated!"
+    except Exception as e:
+        return f"⚠️ Could not edit event: {e}"
+
+
+# ================================================================
+# DELETE — Reminders (local DB + Google Calendar)
+# ================================================================
+def delete_reminder(keyword: str) -> str:
+    try:
+        conn = sqlite3.connect("bot.db")
+        rows = conn.execute(
+            "SELECT id, content, remind_at FROM reminders WHERE done=0 AND content LIKE ?",
+            (f"%{keyword}%",)
+        ).fetchall()
+        if not rows:
+            conn.close()
+            return f"❌ No reminder found matching '{keyword}'. Use *get reminders* to see your list."
+
+        row = rows[0]
+        conn.execute("DELETE FROM reminders WHERE id = ?", (row[0],))
+        conn.commit(); conn.close()
+
+        # Try to delete from Google Calendar too
+        try:
+            calendar_svc, _, _ = get_google_services()
+            now = now_jkt()
+            result = calendar_svc.events().list(
+                calendarId="primary",
+                timeMin=now.isoformat(),
+                maxResults=20,
+                singleEvents=True,
+                orderBy="startTime",
+                q=row[1]
+            ).execute()
+            for ev in result.get("items", []):
+                if keyword.lower() in ev.get("summary", "").lower():
+                    calendar_svc.events().delete(calendarId="primary", eventId=ev["id"]).execute()
+                    break
+        except Exception:
+            pass
+
+        return f"🗑️ Reminder deleted: _{row[1]}_ (was set for {row[2]})"
+    except Exception as e:
+        return f"⚠️ Could not delete reminder: {e}"
+
 # WEBHOOK — AI-powered intent routing
 # ================================================================
 @app.route("/webhook", methods=["POST"])
@@ -1691,6 +2074,58 @@ def webhook():
 
     elif intent == "budget":
         reply_text = calculate_budget(incoming)
+
+    elif intent == "delete_note":
+        idx = params.get("index")
+        kw  = params.get("keyword") or params.get("content")
+        reply_text = delete_note(keyword=kw, index=int(idx) if idx else None)
+
+    elif intent == "edit_note":
+        idx         = params.get("index")
+        kw          = params.get("keyword")
+        new_content = params.get("content") or ""
+        reply_text  = edit_note(new_content, keyword=kw, index=int(idx) if idx else None)
+
+    elif intent == "delete_idea":
+        idx = params.get("index")
+        kw  = params.get("keyword") or params.get("content")
+        reply_text = delete_idea(keyword=kw, index=int(idx) if idx else None)
+
+    elif intent == "edit_idea":
+        idx         = params.get("index")
+        kw          = params.get("keyword")
+        new_content = params.get("content") or ""
+        reply_text  = edit_idea(new_content, keyword=kw, index=int(idx) if idx else None)
+
+    elif intent == "delete_task":
+        idx = params.get("index")
+        kw  = params.get("keyword") or params.get("content")
+        reply_text = delete_task(keyword=kw, index=int(idx) if idx else None)
+
+    elif intent == "edit_task":
+        idx       = params.get("index")
+        kw        = params.get("keyword")
+        new_title = params.get("content") or ""
+        reply_text = edit_task(new_title, keyword=kw, index=int(idx) if idx else None)
+
+    elif intent == "delete_event":
+        kw = params.get("keyword") or params.get("content") or incoming
+        reply_text = delete_event(kw)
+
+    elif intent == "edit_event":
+        kw    = params.get("keyword") or ""
+        parsed = parse_event_with_ai(incoming)
+        reply_text = edit_event(
+            keyword=kw,
+            new_title=parsed.get("title") if parsed else None,
+            new_start=parsed.get("start") if parsed else None,
+            new_end=parsed.get("end") if parsed else None,
+            new_description=parsed.get("description") if parsed else None,
+        )
+
+    elif intent == "delete_reminder":
+        kw = params.get("keyword") or params.get("content") or incoming
+        reply_text = delete_reminder(kw)
 
     else:  # chat — Groq Llama 3.1 8B with full conversation history
         reply_text = ai_chat(incoming)

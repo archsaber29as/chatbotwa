@@ -221,9 +221,14 @@ def get_recent_logs(n: int = 20) -> str:
         if not rows:
             return f"No logs yet for {tab_name}."
         recent = rows[-n:]
-        return "\n".join(
-            f"[{r[0]}] {r[1] if len(r) > 1 else ''}" for r in recent
-        )
+        lines = []
+        for r in recent:
+            entry = f"[{r[0]}] {r[1] if len(r) > 1 else ''}"
+            # Strip everything from "| body:" onward — only keep the HTTP status line
+            if "| body:" in entry:
+                entry = entry[:entry.index("| body:")].rstrip()
+            lines.append(entry)
+        return "\n".join(lines)
     except Exception as e:
         return f"Error reading logs from Sheet: {e}"
 
@@ -350,6 +355,22 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY, content TEXT, remind_at TEXT, done INTEGER DEFAULT 0)")
     c.execute("CREATE TABLE IF NOT EXISTS notes    (id INTEGER PRIMARY KEY, content TEXT, timestamp TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS tasks    (id INTEGER PRIMARY KEY, content TEXT, timestamp TEXT, done INTEGER DEFAULT 0)")
+    # Conversation history: rolling window for multi-turn chat context
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id        INTEGER PRIMARY KEY,
+            role      TEXT,   -- 'user' or 'assistant'
+            content   TEXT,
+            timestamp TEXT
+        )
+    """)
+    # Bot state: key-value store for last_active timestamp and pending flags
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     # Semantic memory: stores embeddings for notes & ideas
     c.execute("""
         CREATE TABLE IF NOT EXISTS embeddings (
@@ -436,13 +457,106 @@ def _memory_context_block(query: str, min_score: float = 0.50) -> str:
     return "\n\nRelevant from your notes & ideas:\n" + "\n".join(items)
 
 # ================================================================
+# CONVERSATION HISTORY — rolling window for multi-turn context
+# ================================================================
+CONV_WINDOW = 10   # keep last N message pairs (user + assistant) in context
+
+def _save_conv_turn(role: str, content: str):
+    """Persist one conversation turn to SQLite."""
+    conn = sqlite3.connect("bot.db")
+    conn.execute(
+        "INSERT INTO conversations (role, content, timestamp) VALUES (?, ?, ?)",
+        (role, content, str(now_jkt()))
+    )
+    # Trim to last CONV_WINDOW * 2 messages (user + assistant pairs)
+    conn.execute("""
+        DELETE FROM conversations
+        WHERE id NOT IN (
+            SELECT id FROM conversations ORDER BY id DESC LIMIT ?
+        )
+    """, (CONV_WINDOW * 2,))
+    conn.commit()
+    conn.close()
+
+def _load_conv_history() -> list[dict]:
+    """Load recent conversation turns as a list of {role, content} dicts."""
+    conn  = sqlite3.connect("bot.db")
+    rows  = conn.execute(
+        "SELECT role, content FROM conversations ORDER BY id ASC"
+    ).fetchall()
+    conn.close()
+    return [{"role": r[0], "content": r[1]} for r in rows]
+
+def _clear_conv_history():
+    """Wipe conversation history (e.g. user says 'new topic' / 'forget that')."""
+    conn = sqlite3.connect("bot.db")
+    conn.execute("DELETE FROM conversations")
+    conn.commit()
+    conn.close()
+
+# ================================================================
+# BOT STATE — key/value store for last_active & pending flags
+# ================================================================
+SESSION_TIMEOUT_MINUTES = 10
+
+def _state_get(key: str) -> str | None:
+    conn = sqlite3.connect("bot.db")
+    row  = conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def _state_set(key: str, value: str):
+    conn = sqlite3.connect("bot.db")
+    conn.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
+def _state_del(key: str):
+    conn = sqlite3.connect("bot.db")
+    conn.execute("DELETE FROM bot_state WHERE key = ?", (key,))
+    conn.commit()
+    conn.close()
+
+def _touch_last_active():
+    """Record current time as last active timestamp."""
+    _state_set("last_active", str(now_jkt()))
+
+def _minutes_since_last_active() -> float | None:
+    """Return minutes elapsed since last message, or None if no record."""
+    raw = _state_get("last_active")
+    if not raw:
+        return None
+    try:
+        last = datetime.datetime.fromisoformat(raw)
+        delta = now_jkt() - last
+        return delta.total_seconds() / 60
+    except Exception:
+        return None
+
+def _is_pending_reset() -> bool:
+    return _state_get("pending_reset") == "1"
+
+def _set_pending_reset(flag: bool):
+    if flag:
+        _state_set("pending_reset", "1")
+    else:
+        _state_del("pending_reset")
+
+# ================================================================
 # GROQ HELPER — wrapper dengan fallback ke Gemini 3.1 Flash Lite
 # ================================================================
-def _groq_complete(system_prompt: str, user_prompt: str, max_tokens: int = 1024, temperature: float = 0.7) -> str:
-    """Call Groq llama-3.1-8b-instant. Jika gagal (401/rate limit/error), fallback ke Gemini 3.1 Flash Lite."""
+def _groq_complete(system_prompt: str, user_prompt: str, max_tokens: int = 1024, temperature: float = 0.7,
+                   history: list[dict] | None = None) -> str:
+    """Call Groq llama-3.1-8b-instant. Jika gagal (401/rate limit/error), fallback ke Gemini 3.1 Flash Lite.
+    
+    If `history` is provided, it is inserted between the system prompt and the
+    current user message so the model has full multi-turn context.
+    """
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
+    if history:
+        messages.extend(history)
     messages.append({"role": "user", "content": user_prompt})
 
     # --- Primary: Groq ---
@@ -516,7 +630,7 @@ Classify the user's message into exactly ONE of these intents:
   get_events    — VIEW, check, look up, or list existing calendar events
   search_memory — ask about something that might be in their notes/ideas
   quote         — ask for a motivational/inspirational quote (e.g. "give me a quote", "motivate me", "quote of the day", "inspire me")
-  budget        — calculate daily budget / sisa uang / berapa sisa per hari / budget harian / survive until payday / kalkulasi budget / hitung uang sisa (user wants to know how much they can spend per day until the 25th payroll date)
+  budget        — CALCULATE or COMPUTE a budget with actual numbers: user provides a specific monetary amount and wants to know how much they can spend per day / sisa uang / berapa sisa per hari / survive until payday / kalkulasi budget / hitung uang sisa. Requires a specific monetary figure or explicit calculation request.
   chat          — general conversation or anything else
 
 KEY DISAMBIGUATION RULES (apply these before classifying):
@@ -527,6 +641,8 @@ KEY DISAMBIGUATION RULES (apply these before classifying):
 - "add event X" / "schedule X" / "create event X" / "new event X" → add_event
 - "show my reminders" / "list reminders" / "what are my reminders" → get_reminders
 - The word "remind" alone does NOT mean intent=reminder. Look at the full sentence structure.
+- "how to budget" / "tips for budgeting" / "how to spend daily budget wisely" / any advice or how-to question about money → chat (NOT budget). The budget intent requires actual numbers to calculate, not general advice.
+- "how to spend my daily budget wisely?" → chat (advice question, no number to calculate)
 
 Reply ONLY with a JSON object (no markdown, no preamble):
 {{"intent": "<intent>", "params": {{"content": "<extracted content if any>", "keyword": "<keyword if applicable>", "date": "<date if mentioned, e.g. 2025-05-10>"}}}}
@@ -629,14 +745,29 @@ User message: {user_input}"""
         return user_input, fallback_dt
 
 def ai_chat(user_input: str) -> str:
-    """General chat using Groq Llama 3.1 8B, enriched with semantic memory context."""
+    """General chat using Groq Llama 3.1 8B, with full conversation history + semantic memory."""
+    # Detect explicit context-reset requests
+    reset_triggers = {"new topic", "forget that", "start over", "reset chat",
+                      "mulai baru", "hapus history", "ganti topik", "clear chat"}
+    if user_input.strip().lower() in reset_triggers:
+        _clear_conv_history()
+        return "🔄 Got it! Fresh start — what's on your mind?"
+
+    # Load rolling conversation history
+    history    = _load_conv_history()
     memory_ctx = _memory_context_block(user_input, min_score=0.55)
-    prompt = (
-        f"You are a helpful WhatsApp personal assistant. Reply concisely and friendly."
-        f"{memory_ctx}\n\nUser: {user_input}"
+
+    system_prompt = (
+        "You are a helpful, friendly WhatsApp personal assistant. "
+        "Keep replies concise and conversational — this is a chat, not an essay. "
+        "Use the conversation history to maintain context across follow-up messages. "
+        "If the user refers to something from earlier (e.g. 'that', 'it', 'the one you mentioned'), "
+        "look it up in the history and respond accordingly."
+        + (f"\n\nRelevant from user's notes & ideas:{memory_ctx}" if memory_ctx else "")
     )
+
     try:
-        return _groq_complete("", prompt, max_tokens=1024, temperature=0.7)
+        reply = _groq_complete(system_prompt, user_input, max_tokens=1024, temperature=0.7, history=history)
     except Exception as e:
         err = str(e)
         if "503" in err or "UNAVAILABLE" in err:
@@ -644,6 +775,12 @@ def ai_chat(user_input: str) -> str:
         if "429" in err or "rate_limit" in err.lower():
             return "⚠️ API quota reached. Try again later."
         return "⚠️ Something went wrong. Please try again."
+
+    # Persist both turns so next message has context
+    _save_conv_turn("user",      user_input)
+    _save_conv_turn("assistant", reply)
+
+    return reply
 
 # ================================================================
 # DAILY QUOTE — API Ninjas quotes, tailored by Groq
@@ -1224,32 +1361,27 @@ scheduler.start()
 # BUDGET CALCULATOR — daily survival calculator until payroll (25th)
 # ================================================================
 
-# Fixed monthly expenses: (name, amount, due_day or None for conditional)
 FIXED_EXPENSES = [
     {"name": "House Rent",        "amount": 955_000,  "due_day": 25},
-    {"name": "Internet",          "amount": 150_000,  "due_day": None},   # conditional
-    {"name": "Zakat",             "amount": 250_000,  "due_day": 25},     # often 25th
+    {"name": "Internet",          "amount": 150_000,  "due_day": None},
+    {"name": "Zakat",             "amount": 250_000,  "due_day": 25},
     {"name": "House Maintenance", "amount": 600_000,  "due_day": 9},
 ]
 
-# Variable monthly budgets: (name, total_budget)
 VARIABLE_BUDGETS = [
     {"name": "Ticket to go home", "budget": 600_000},
     {"name": "Fuel",              "budget": 70_000},
     {"name": "Laundry",          "budget": 60_000},
 ]
 
-PAYROLL_DAY = 25   # day of month salary arrives
+PAYROLL_DAY = 25
 
 
 def _parse_budget_input(user_input: str) -> dict | None:
-    """Use Groq to extract budget calculator parameters from natural language."""
     now   = now_jkt()
     today = now.day
     month = now.strftime("%B")
     year  = now.year
-
-    # Build a description of known expenses for context
     fixed_names    = ", ".join(e["name"] for e in FIXED_EXPENSES)
     variable_names = ", ".join(v["name"] for v in VARIABLE_BUDGETS)
 
@@ -1258,15 +1390,13 @@ def _parse_budget_input(user_input: str) -> dict | None:
 The user has these fixed monthly expenses: {fixed_names}
 The user has these variable monthly budgets: {variable_names}
 
-Extract the following from the user's message:
-1. "remaining_money": total money they have right now (integer, in IDR)
-2. "paid_fixed": list of fixed expense names already paid this month (from the fixed list above)
-3. "spent_variable": dict of variable budget name → amount already spent (from the variable list above)
-4. "pending_conditional": list of conditional expense names still expected this month (e.g. "Internet" if not yet paid)
+Extract:
+1. "remaining_money": total money right now (integer IDR)
+2. "paid_fixed": list of fixed expense names already paid this month
+3. "spent_variable": dict of variable budget name → amount spent
+4. "pending_conditional": list of conditional expense names still expected this month
 
-If a value is not mentioned, omit it or use null.
-
-Reply ONLY with a valid JSON object, no markdown, no explanation:
+Reply ONLY with valid JSON, no markdown:
 {{"remaining_money": <int or null>, "paid_fixed": [<names>], "spent_variable": {{"<name>": <amount>}}, "pending_conditional": [<names>]}}
 
 User message: {user_input}"""
@@ -1286,13 +1416,9 @@ User message: {user_input}"""
 
 
 def _budget_interactive_prompt() -> str:
-    """Return an interactive step-by-step prompt when user triggers budget without enough info."""
-    now     = now_jkt()
-    today   = now.day
-    days_left = (PAYROLL_DAY - today) if today < PAYROLL_DAY else (
-        (PAYROLL_DAY + (31 - today))  # rough next month estimate
-    )
-
+    now       = now_jkt()
+    today     = now.day
+    days_left = (PAYROLL_DAY - today) if today < PAYROLL_DAY else (31 - today + PAYROLL_DAY)
     lines = [
         f"💰 *Budget Calculator* — {days_left} days until payday (25th)\n",
         "Please tell me:",
@@ -1311,26 +1437,21 @@ def _budget_interactive_prompt() -> str:
 
 
 def calculate_budget(user_input: str) -> str:
-    """Parse natural language budget input and return daily survival budget."""
     now   = now_jkt()
     today = now.day
 
-    # Days remaining until 25th payroll
     if today <= PAYROLL_DAY:
         days_left = PAYROLL_DAY - today
     else:
-        # Already past 25th, count to next month's 25th
         import calendar
         days_in_month = calendar.monthrange(now.year, now.month)[1]
         days_left = (days_in_month - today) + PAYROLL_DAY
 
-    # If user just said "budget" or "hitung budget" with no data, guide them
     bare_triggers = {"budget", "hitung budget", "kalkulasi budget", "budget calculator",
                      "budget harian", "sisa budget", "budget check"}
     if user_input.strip().lower() in bare_triggers:
         return _budget_interactive_prompt()
 
-    # Try to parse the input
     parsed = _parse_budget_input(user_input)
     if not parsed or parsed.get("remaining_money") is None:
         return _budget_interactive_prompt()
@@ -1340,18 +1461,13 @@ def calculate_budget(user_input: str) -> str:
     spent_variable = {k.lower(): v for k, v in (parsed.get("spent_variable") or {}).items()}
     pending_cond   = [n.lower() for n in (parsed.get("pending_conditional") or [])]
 
-    # Calculate still-owed fixed expenses
     still_owed = []
     for exp in FIXED_EXPENSES:
-        name_lower = exp["name"].lower()
+        name_lower  = exp["name"].lower()
         already_paid = any(name_lower in p or p in name_lower for p in paid_fixed)
-        if already_paid:
-            continue
-        # Skip non-conditional ones that are past their due date and not yet paid
-        # (they may have been paid but user forgot to mention — include them to be safe)
-        still_owed.append(exp)
+        if not already_paid:
+            still_owed.append(exp)
 
-    # Calculate remaining variable budgets
     remaining_var = []
     for var in VARIABLE_BUDGETS:
         name_lower = var["name"].lower()
@@ -1364,22 +1480,19 @@ def calculate_budget(user_input: str) -> str:
         if leftover > 0:
             remaining_var.append({"name": var["name"], "remaining": leftover, "spent": spent})
 
-    # Also include pending conditional expenses as deductions
     pending_amounts = []
     for exp in FIXED_EXPENSES:
         name_lower = exp["name"].lower()
         if any(name_lower in p or p in name_lower for p in pending_cond):
-            # Only if not already in still_owed
             if not any(e["name"].lower() == name_lower for e in still_owed):
                 pending_amounts.append(exp)
 
-    total_still_owed   = sum(e["amount"] for e in still_owed) + sum(e["amount"] for e in pending_amounts)
+    total_still_owed    = sum(e["amount"] for e in still_owed) + sum(e["amount"] for e in pending_amounts)
     total_var_remaining = sum(v["remaining"] for v in remaining_var)
-    total_deductions   = total_still_owed + total_var_remaining
-    free_money         = remaining - total_deductions
-    daily_budget       = free_money / days_left if days_left > 0 else free_money
+    total_deductions    = total_still_owed + total_var_remaining
+    free_money          = remaining - total_deductions
+    daily_budget        = free_money / days_left if days_left > 0 else free_money
 
-    # Format the output
     def fmt(n): return f"Rp {int(n):,}".replace(",", ".")
 
     lines = [f"💰 *Budget Breakdown* — {days_left} days to payday (25th)\n"]
@@ -1399,7 +1512,7 @@ def calculate_budget(user_input: str) -> str:
             lines.append(f"  • {v['name']}: {fmt(v['remaining'])} (spent {fmt(v['spent'])})")
         lines.append(f"  ➤ Total: {fmt(total_var_remaining)}\n")
 
-    lines.append(f"📊 *Summary:*")
+    lines.append("📊 *Summary:*")
     lines.append(f"  Money in hand:      {fmt(remaining)}")
     lines.append(f"  Total deductions:   -{fmt(total_deductions)}")
     lines.append(f"  Free money left:    {fmt(free_money)}")
@@ -1430,17 +1543,49 @@ def webhook():
     resp     = MessagingResponse()
     msg      = resp.message()
 
-    # Step 0: Hard-coded keyword shortcuts — never go through AI classifier
-    _log_triggers = {"show logs", "show log", "lihat log", "cek log", "log error",
-                     "logs", "/logs", "show errors", "bot status", "status bot"}
-    if any(t in lower for t in _log_triggers):
+    # ── Step 0a: Handle pending reset confirmation ──────────────────
+    if _is_pending_reset():
+        _set_pending_reset(False)
+        _touch_last_active()
+        yes_words = {"yes", "ya", "yep", "yup", "reset", "clear", "iya", "ok", "okay", "sure"}
+        no_words  = {"no", "nope", "tidak", "nggak", "ngga", "lanjut", "continue", "stay", "keep"}
+        if any(w in lower for w in yes_words):
+            _clear_conv_history()
+            msg.body("🔄 Session reset! Fresh start — what's on your mind?")
+        elif any(w in lower for w in no_words):
+            msg.body("👍 Continuing your previous session. What's up?")
+        else:
+            # Ambiguous — treat as "no" and process normally, but re-run through intent router
+            # by falling through after clearing the flag (already done above)
+            msg.body("👍 Keeping your session. What's up?")
+        return str(resp)
+
+    # ── Step 0b: Session timeout check ─────────────────────────────
+    minutes_idle = _minutes_since_last_active()
+    if minutes_idle is not None and minutes_idle >= SESSION_TIMEOUT_MINUTES:
+        _set_pending_reset(True)
+        _touch_last_active()
+        idle_str = f"{int(minutes_idle)} minutes"
+        msg.body(
+            f"⏱️ It's been {idle_str} since your last message.\n\n"
+            f"Start a *fresh session* or continue where you left off?\n\n"
+            f"Reply *yes* to reset  |  *no* to continue"
+        )
+        return str(resp)
+
+    # Update last_active for every normal message
+    _touch_last_active()
+
+    # Step 0c: Hard-coded keyword shortcuts — never go through AI classifier
+    # Only trigger on explicit /logs command to avoid false positives.
+    if lower.startswith("/logs"):
         n = 20
         nums = re.findall(r"\d+", incoming)
         if nums:
             n = min(int(nums[0]), 50)
         logs = get_recent_logs(n)
-        logs_truncated = logs[-1400:]  # Take only the LAST 1400 chars
-        msg.body(f"🖥️ *Last {n} log lines:*\n\n{logs}")
+        logs_truncated = logs[-1400:]
+        msg.body(f"🖥️ *Last {n} log lines:*\n\n{logs_truncated}")
         return str(resp)
 
     # Step 1: Classify intent dengan Groq Llama 3.1 8B
@@ -1449,109 +1594,114 @@ def webhook():
     params     = classified.get("params", {})
 
     # Step 2: Route to the appropriate handler
+    reply_text = ""
+
     if intent == "reminder":
         content, remind_at = parse_reminder_with_ai(incoming)
-        msg.body(save_reminder(content, remind_at))
+        reply_text = save_reminder(content, remind_at)
 
     elif intent == "get_reminders":
-        date_hint = params.get("date") or None
-        msg.body(get_reminders_list(date_hint))
+        date_hint  = params.get("date") or None
+        reply_text = get_reminders_list(date_hint)
 
     elif intent == "complete_task":
         keyword = params.get("keyword") or re.sub(
             r"complete task|finish task|done task|selesai task", "", lower
         ).strip(" :?!")
-        msg.body(complete_task(keyword))
+        reply_text = complete_task(keyword)
 
     elif intent == "get_tasks":
-        msg.body(get_tasks())
+        reply_text = get_tasks()
 
     elif intent == "add_task":
-        content = params.get("content") or re.sub(
+        content    = params.get("content") or re.sub(
             r"add task|new task|tambah task|create task|task:", "", lower
         ).strip(" :?!") or incoming
-        msg.body(save_task(content))
+        reply_text = save_task(content)
 
     elif intent == "get_notes":
-        msg.body(get_notes())
+        reply_text = get_notes()
 
     elif intent == "add_note":
-        content = params.get("content") or re.sub(
+        content    = params.get("content") or re.sub(
             r"note:|notes:|add note|save note|catatan:|catat", "", lower
         ).strip(" :?!") or incoming
-        msg.body(save_note(content))
+        reply_text = save_note(content)
 
     elif intent == "get_ideas":
-        msg.body(get_ideas())
+        reply_text = get_ideas()
 
     elif intent == "add_idea":
-        content = params.get("content") or re.sub(
+        content    = params.get("content") or re.sub(
             r"idea:|save idea|add idea|ide:|simpan ide", "", lower
         ).strip(" :?!") or incoming
-        msg.body(save_idea(content))
+        reply_text = save_idea(content)
 
     elif intent == "news":
         topic = params.get("content") or lower
         for w in ["news", "berita", "headline", "latest", "terbaru", "about", "tentang", "get", "show", "give me"]:
             topic = topic.replace(w, "").strip(" ?!.,")
-        msg.body(get_news(topic or "world"))
+        reply_text = get_news(topic or "world")
 
     elif intent == "brainstorm":
-        topic = params.get("content") or re.sub(
+        topic      = params.get("content") or re.sub(
             r"brainstorm|ide|ideas?|pikir|think about|think of", "", lower
         ).strip(" :?!") or incoming
-        msg.body(ai_brainstorm(topic))
+        reply_text = ai_brainstorm(topic)
 
     elif intent == "get_events":
         date_hint = params.get("date") or None
-        # If no date was extracted by classifier, try to parse it with AI
         if not date_hint:
             date_hint = _parse_date_from_message(incoming)
-        msg.body(get_events(date_hint, incoming))
+        reply_text = get_events(date_hint, incoming)
 
     elif intent == "add_event":
-        # AI-powered natural language event parsing — no strict format required
         parsed = parse_event_with_ai(incoming)
         if parsed and parsed.get("title") and parsed.get("start"):
-            msg.body(save_event(
+            reply_text = save_event(
                 parsed["title"].strip(),
                 parsed["start"].strip(),
                 parsed["end"].strip() if parsed.get("end") else None,
                 parsed.get("description", "")
-            ))
+            )
         else:
-            msg.body(
+            reply_text = (
                 "⚠️ Could not understand the event.\n"
                 "Try: *Add event Team lunch on April 22 at 1pm*\n"
                 "Or: *New event Meeting tomorrow at 3pm for 2 hours*"
             )
 
     elif intent == "search_memory":
-        # Gemini Embedding 2: semantic search through notes & ideas
         results = semantic_search(incoming, top_k=5, min_score=0.45)
         if results:
             items = [
                 f"{i+1}. {r['content']} _({r['source_type']}, {round(r['score']*100)}% match)_"
                 for i, r in enumerate(results)
             ]
-            msg.body("🔍 *Found in your memory:*\n\n" + "\n".join(items))
+            reply_text = "🔍 *Found in your memory:*\n\n" + "\n".join(items)
         else:
-            msg.body("🔍 Nothing relevant found in your notes or ideas.")
+            reply_text = "🔍 Nothing relevant found in your notes or ideas."
 
     elif intent == "quote":
-        # Extract optional theme/context from the message
-        context = re.sub(
+        context    = re.sub(
             r"quote|motivate me|inspire me|motivasi|inspirasi|give me a|berikan|kasih",
             "", lower
         ).strip(" :?!")
-        msg.body(generate_daily_quote(context))
+        reply_text = generate_daily_quote(context)
 
     elif intent == "budget":
-        msg.body(calculate_budget(incoming))
+        reply_text = calculate_budget(incoming)
 
-    else:  # chat — Groq Llama 3.1 8B with memory context
-        msg.body(ai_chat(incoming))
+    else:  # chat — Groq Llama 3.1 8B with full conversation history
+        reply_text = ai_chat(incoming)
 
+    # ── Save every turn (except chat, which saves itself) to conversation history ──
+    # This lets follow-up messages like "can you edit that?" have full context.
+    if intent != "chat" and reply_text:
+        _save_conv_turn("user",      incoming)
+        _save_conv_turn("assistant", reply_text)
+
+    msg.body(reply_text)
     return str(resp)
 
 # ================================================================
