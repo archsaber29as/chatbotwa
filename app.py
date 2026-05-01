@@ -827,8 +827,6 @@ _QUOTE_CATEGORY_MAP = {
     "berani":  "courage",
 }
 
-
-
 def _fetch_ninja_quote(category: str = "") -> dict | None:
     """Fetch one quote from API Ninjas. Returns dict with 'quote' and 'author', or None on failure."""
     try:
@@ -1349,8 +1347,47 @@ def check_and_send_reminders():
         conn.commit()
     conn.close()
 
+# ================================================================
+# SESSION TIMEOUT CHECKER — proactive push (runs every minute)
+# ================================================================
+def check_session_timeout():
+    """Proactively push a reset prompt if the user has been idle too long.
+    Mirrors check_and_send_reminders: uses Twilio to send outbound message."""
+    # Skip if already waiting for a reset confirmation
+    if _is_pending_reset():
+        return
+
+    minutes_idle = _minutes_since_last_active()
+
+    # No activity recorded yet, or not idle long enough
+    if minutes_idle is None or minutes_idle < SESSION_TIMEOUT_MINUTES:
+        return
+
+    # Mark pending so we don't spam multiple prompts
+    _set_pending_reset(True)
+    _touch_last_active()
+
+    try:
+        idle_str = f"{int(minutes_idle)} minutes"
+        twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
+        twilio_client.messages.create(
+            from_=TWILIO_SANDBOX_NUMBER,
+            to=YOUR_NUMBER,
+            body=(
+                f"⏱️ It's been {idle_str} since your last message.\n\n"
+                f"Start a *fresh session* or continue where you left off?\n\n"
+                f"Reply *yes* to reset  |  *no* to continue"
+            )
+        )
+        print(f"[Session timeout] Idle prompt sent after {idle_str}.")
+    except Exception as e:
+        # Roll back the flag so it retries next minute
+        _set_pending_reset(False)
+        print(f"[Session timeout] Failed to send idle prompt: {e}")
+
 scheduler = BackgroundScheduler(timezone=TZ_JKT)
 scheduler.add_job(check_and_send_reminders, "interval", minutes=1)
+scheduler.add_job(check_session_timeout,    "interval", minutes=1)  # ← NEW
 
 # ── Daily quote jobs (Jakarta time) ─────────────────────────────
 scheduler.add_job(
@@ -1544,8 +1581,6 @@ def calculate_budget(user_input: str) -> str:
 
     return "\n".join(lines)
 
-
-# ================================================================
 
 # ================================================================
 # DELETE / EDIT — Notes
@@ -1917,6 +1952,7 @@ def delete_reminder(keyword: str) -> str:
     except Exception as e:
         return f"⚠️ Could not delete reminder: {e}"
 
+# ================================================================
 # WEBHOOK — AI-powered intent routing
 # ================================================================
 @app.route("/webhook", methods=["POST"])
@@ -1938,28 +1974,15 @@ def webhook():
         elif any(w in lower for w in no_words):
             msg.body("👍 Continuing your previous session. What's up?")
         else:
-            # Ambiguous — treat as "no" and process normally, but re-run through intent router
-            # by falling through after clearing the flag (already done above)
+            # Ambiguous — treat as "no"
             msg.body("👍 Keeping your session. What's up?")
         return str(resp)
 
-    # ── Step 0b: Session timeout check ─────────────────────────────
-    minutes_idle = _minutes_since_last_active()
-    if minutes_idle is not None and minutes_idle >= SESSION_TIMEOUT_MINUTES:
-        _set_pending_reset(True)
-        _touch_last_active()
-        idle_str = f"{int(minutes_idle)} minutes"
-        msg.body(
-            f"⏱️ It's been {idle_str} since your last message.\n\n"
-            f"Start a *fresh session* or continue where you left off?\n\n"
-            f"Reply *yes* to reset  |  *no* to continue"
-        )
-        return str(resp)
-
-    # Update last_active for every normal message
+    # ── Step 0b: Update last_active for every normal message ────────
+    # (Session timeout is now handled proactively by check_session_timeout scheduler)
     _touch_last_active()
 
-    # Step 0c: Hard-coded keyword shortcuts — never go through AI classifier
+    # ── Step 0c: Hard-coded keyword shortcuts ───────────────────────
     # Only trigger on explicit /logs command to avoid false positives.
     if lower.startswith("/logs"):
         n = 20
@@ -2175,4 +2198,4 @@ def logs_endpoint():
     return html, 200, {"Content-Type": "text/html"}
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", debug=True, use_reloader=False,port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", debug=True, use_reloader=False, port=int(os.environ.get("PORT", 5000)))
