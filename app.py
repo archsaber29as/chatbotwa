@@ -1852,7 +1852,7 @@ def edit_task(new_title: str, keyword: str = None, index: int = None) -> str:
 def delete_event(keyword: str) -> str:
     try:
         calendar_svc, _, _ = get_google_services()
-        now = now_jkt()
+        now = localize_jkt(now_jkt())
         result = calendar_svc.events().list(
             calendarId="primary",
             timeMin=now.isoformat(),
@@ -1875,7 +1875,7 @@ def delete_event(keyword: str) -> str:
 def edit_event(keyword: str, new_title: str = None, new_start: str = None, new_end: str = None, new_description: str = None) -> str:
     try:
         calendar_svc, _, _ = get_google_services()
-        now = now_jkt()
+        now = localize_jkt(now_jkt())
         result = calendar_svc.events().list(
             calendarId="primary",
             timeMin=now.isoformat(),
@@ -1932,7 +1932,7 @@ def delete_reminder(keyword: str) -> str:
         # Try to delete from Google Calendar too
         try:
             calendar_svc, _, _ = get_google_services()
-            now = now_jkt()
+            now = localize_jkt(now_jkt())
             result = calendar_svc.events().list(
                 calendarId="primary",
                 timeMin=now.isoformat(),
