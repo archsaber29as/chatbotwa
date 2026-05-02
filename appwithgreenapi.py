@@ -2,8 +2,6 @@ from dotenv import load_dotenv
 load_dotenv('environtment.env')
 
 from flask import Flask, request
-from twilio.twiml.messaging_response import MessagingResponse
-from twilio.rest import Client as TwilioClient
 from google import genai
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -276,10 +274,29 @@ MODEL_FALLBACK   = "gemini-3.1-flash-lite-preview"    # Gemini 3.1 Flash Lite �
 gemini_client         = genai.Client(api_key=os.environ["GEMINI_API_KEY"])  # untuk embedding & brainstorm
 groq_client           = Groq(api_key=os.environ["GROQ_API_KEY"])            # untuk classifier, chat, parser
 NEWS_API_KEY          = os.environ["NEWS_API_KEY"]
-YOUR_NUMBER           = os.environ["YOUR_NUMBER"]
-TWILIO_SID            = os.environ["TWILIO_ACCOUNT_SID"]
-TWILIO_TOKEN          = os.environ["TWILIO_AUTH_TOKEN"]
-TWILIO_SANDBOX_NUMBER = "whatsapp:+14155238886"
+YOUR_NUMBER           = os.environ["YOUR_NUMBER"]   # e.g. 628123456789 (no + or whatsapp: prefix)
+GREEN_API_INSTANCE    = os.environ["GREEN_API_INSTANCE_ID"]
+GREEN_API_TOKEN       = os.environ["GREEN_API_TOKEN"]
+GREEN_API_INSTANCE    = os.environ['GREEN_API_INSTANCE_ID']
+GREEN_API_TOKEN_VAL   = os.environ['GREEN_API_TOKEN']
+GREEN_API_BASE        = f"https://api.green-api.com/waInstance{os.environ['GREEN_API_INSTANCE_ID']}"
+
+def send_whatsapp(to: str, body: str):
+    """Send a WhatsApp message via Green API.
+    `to` can be '628xxx@c.us' (from webhook) or '628xxx' (from YOUR_NUMBER env var).
+    """
+    url = f"{GREEN_API_BASE}/sendMessage/{os.environ['GREEN_API_TOKEN']}"
+    # Normalise: strip whatsapp: prefix, add @c.us only if missing
+    chat_id = to.replace("whatsapp:", "").strip()
+    if not chat_id.endswith("@c.us"):
+        chat_id = f"{chat_id}@c.us"
+    payload = {"chatId": chat_id, "message": body}
+    print(f"[Green API] sending to={chat_id}")
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        print(f"[Green API] sendMessage status={r.status_code} body={r.text[:200]}")
+    except Exception as e:
+        print(f"[Green API] sendMessage error: {e}")
 SPREADSHEET_ID        = os.environ["GOOGLE_SHEET_ID"]
 LOG_SPREADSHEET_ID    = os.environ["LOG_SHEET_ID"]       # separate spreadsheet for daily bot logs
 
@@ -873,15 +890,10 @@ def generate_daily_quote(context: str = "") -> str:
     return f"_{quote}_\n{author}"
 
 def _send_scheduled_quote(label: str):
-    """Send an auto-scheduled quote to YOUR_NUMBER via Twilio."""
+    """Send an auto-scheduled quote to YOUR_NUMBER via Green API."""
     try:
         body = generate_daily_quote()
-        twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
-        twilio_client.messages.create(
-            from_=TWILIO_SANDBOX_NUMBER,
-            to=YOUR_NUMBER,
-            body=body
-        )
+        send_whatsapp(YOUR_NUMBER, body)
         print(f"[Quote scheduler] {label} quote sent successfully.")
     except Exception as e:
         print(f"[Quote scheduler] Failed to send {label} quote: {e}")
@@ -1406,13 +1418,8 @@ def check_and_send_reminders():
         (win_lo, win_hi)
     ).fetchall()
     if rows:
-        twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
         for row in rows:
-            twilio_client.messages.create(
-                from_=TWILIO_SANDBOX_NUMBER,
-                to=YOUR_NUMBER,
-                body=f"⏰ *Reminder:* {row[1]}"
-            )
+            send_whatsapp(YOUR_NUMBER, f"⏰ *Reminder:* {row[1]}")
             conn.execute("UPDATE reminders SET done = 1 WHERE id = ?", (row[0],))
         conn.commit()
     conn.close()
@@ -1439,15 +1446,11 @@ def check_session_timeout():
 
     try:
         idle_str = f"{int(minutes_idle)} minutes"
-        twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN)
-        twilio_client.messages.create(
-            from_=TWILIO_SANDBOX_NUMBER,
-            to=YOUR_NUMBER,
-            body=(
-                f"⏱️ It's been {idle_str} since your last message.\n\n"
-                f"Start a *fresh session* or continue where you left off?\n\n"
-                f"Reply *yes* to reset  |  *no* to continue"
-            )
+        send_whatsapp(
+            YOUR_NUMBER,
+            f"⏱️ It's been {idle_str} since your last message.\n\n"
+            f"Start a *fresh session* or continue where you left off?\n\n"
+            f"Reply *yes* to reset  |  *no* to continue"
         )
         print(f"[Session timeout] Idle prompt sent after {idle_str}.")
     except Exception as e:
@@ -2034,10 +2037,34 @@ def delete_reminder(keyword: str) -> str:
 # ================================================================
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    incoming = request.form.get("Body", "").strip()
-    lower    = incoming.lower()
-    resp     = MessagingResponse()
-    msg      = resp.message()
+    # Green API sends JSON for incomingMessageReceived.
+    # We extract the text, process it, then reply via sendMessage REST call.
+    # No TwiML needed - just return 200 OK.
+    data = request.get_json(force=True, silent=True) or {}
+    print(f"[Green API raw] {json.dumps(data)[:300]}")  # DEBUG
+
+    # Only process incoming messages (ignore outgoing/status webhooks to prevent loop)
+    webhook_type = data.get("typeWebhook", "")
+    if webhook_type != "incomingMessageReceived":
+        print(f"[Webhook] Ignored typeWebhook={webhook_type}")
+        return "ok", 200
+
+    # Only handle text messages
+    msg_data  = data.get("messageData", {})
+    type_msg  = msg_data.get("typeMessage", "")
+    if type_msg != "textMessage":
+        print(f"[Webhook] Ignored typeMessage={type_msg}")
+        return "ok", 200
+
+    incoming  = msg_data.get("textMessageData", {}).get("textMessage", "").strip()
+    sender    = data.get("senderData", {}).get("chatId", "")  # e.g. 628xxx@c.us
+    lower     = incoming.lower()
+
+    if not incoming:
+        return "ok", 200
+
+    print(f"[Webhook] From {sender}: {incoming[:80]}")
+
 
     # ── Step 0a: Handle pending reset confirmation ──────────────────
     if _is_pending_reset():
@@ -2047,13 +2074,13 @@ def webhook():
         no_words  = {"no", "nope", "tidak", "nggak", "ngga", "lanjut", "continue", "stay", "keep"}
         if any(w in lower for w in yes_words):
             _clear_conv_history()
-            msg.body("🔄 Session reset! Fresh start — what's on your mind?")
+            reply_text = "🔄 Session reset! Fresh start — what's on your mind?"
         elif any(w in lower for w in no_words):
-            msg.body("👍 Continuing your previous session. What's up?")
+            reply_text = "👍 Continuing your previous session. What's up?"
         else:
-            # Ambiguous — treat as "no"
-            msg.body("👍 Keeping your session. What's up?")
-        return str(resp)
+            reply_text = "👍 Keeping your session. What's up?"
+        send_whatsapp(sender or YOUR_NUMBER, reply_text)
+        return "ok", 200
 
     # ── Step 0b: Update last_active for every normal message ────────
     # (Session timeout is now handled proactively by check_session_timeout scheduler)
@@ -2068,8 +2095,8 @@ def webhook():
             n = min(int(nums[0]), 50)
         logs = get_recent_logs(n)
         logs_truncated = logs[-1400:]
-        msg.body(f"🖥️ *Last {n} log lines:*\n\n{logs_truncated}")
-        return str(resp)
+        send_whatsapp(sender or YOUR_NUMBER, f"🖥️ *Last {n} log lines:*\n\n{logs_truncated}")
+        return "ok", 200
 
     # Step 1: Classify intent dengan Groq Llama 3.1 8B
     classified = classify_intent(incoming)
@@ -2251,8 +2278,9 @@ def webhook():
         _save_conv_turn("user",      incoming)
         _save_conv_turn("assistant", reply_text)
 
-    msg.body(reply_text)
-    return str(resp)
+    if reply_text:
+        send_whatsapp(sender or YOUR_NUMBER, reply_text)
+    return "ok", 200
 
 # ================================================================
 # /logs — browser log viewer, auto-refreshes every 10s
