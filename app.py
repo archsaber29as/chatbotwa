@@ -2032,6 +2032,7 @@ def webhook():
     # We extract the text, process it, then reply via sendMessage REST call.
     # No TwiML needed - just return 200 OK.
     data = request.get_json(force=True, silent=True) or {}
+    print(f"[Green API raw] {json.dumps(data)[:300]}")  # DEBUG - remove after confirmed working
 
     # Only handle incoming text messages
     msg_data  = data.get("messageData", {})
@@ -2057,13 +2058,13 @@ def webhook():
         no_words  = {"no", "nope", "tidak", "nggak", "ngga", "lanjut", "continue", "stay", "keep"}
         if any(w in lower for w in yes_words):
             _clear_conv_history()
-            msg.body("🔄 Session reset! Fresh start — what's on your mind?")
+            reply_text = "🔄 Session reset! Fresh start — what's on your mind?"
         elif any(w in lower for w in no_words):
-            msg.body("👍 Continuing your previous session. What's up?")
+            reply_text = "👍 Continuing your previous session. What's up?"
         else:
-            # Ambiguous — treat as "no"
-            msg.body("👍 Keeping your session. What's up?")
-        return str(resp)
+            reply_text = "👍 Keeping your session. What's up?"
+        send_whatsapp(sender or YOUR_NUMBER, reply_text)
+        return "ok", 200
 
     # ── Step 0b: Update last_active for every normal message ────────
     # (Session timeout is now handled proactively by check_session_timeout scheduler)
@@ -2078,8 +2079,8 @@ def webhook():
             n = min(int(nums[0]), 50)
         logs = get_recent_logs(n)
         logs_truncated = logs[-1400:]
-        msg.body(f"🖥️ *Last {n} log lines:*\n\n{logs_truncated}")
-        return str(resp)
+        send_whatsapp(sender or YOUR_NUMBER, f"🖥️ *Last {n} log lines:*\n\n{logs_truncated}")
+        return "ok", 200
 
     # Step 1: Classify intent dengan Groq Llama 3.1 8B
     classified = classify_intent(incoming)
