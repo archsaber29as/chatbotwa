@@ -656,8 +656,14 @@ KEY DISAMBIGUATION RULES (apply these before classifying):
 - "edit/update/change/ubah note/idea/task/event/reminder X to/with Y" → edit_* intent
 - "delete task X" → delete_task (permanently remove), NOT complete_task (which marks done)
 
+For get_notes, get_ideas, get_tasks intents, also extract optional display range params:
+- "list notes 9-13" or "notes 9 to 13" → range_start: 9, range_end: 13
+- "list notes 5" or "show 5 notes" → count: 5  (show last N)
+- "list notes all" or "show all notes" → range_all: true
+- "list notes" (no range) → leave range fields absent
+
 Reply ONLY with a JSON object (no markdown, no preamble):
-{{"intent": "<intent>", "params": {{"content": "<new content for edit intents>", "keyword": "<item to find/delete/edit>", "index": "<item number if user said e.g. note 2>", "date": "<date if mentioned, e.g. 2025-05-10>"}}}}
+{{"intent": "<intent>", "params": {{"content": "<new content for edit intents>", "keyword": "<item to find/delete/edit>", "index": "<item number if user said e.g. note 2>", "date": "<date if mentioned, e.g. 2025-05-10>", "range_start": "<int or null>", "range_end": "<int or null>", "count": "<int or null>", "range_all": "<true or null>"}}}}
 
 User message: {message}"""
 
@@ -943,19 +949,25 @@ def save_idea(text: str) -> str:
     except Exception as e:
         return f"💡 Idea saved locally.\n🧠 Memorized for semantic search.\n⚠️ Sheets sync failed: {str(e)}"
 
-def get_ideas() -> str:
+def get_ideas(range_start=None, range_end=None, count=None, range_all=False) -> str:
     try:
         _, sheets_svc, _ = get_google_services()
         result = sheets_svc.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID, range="Ideas!A:B"
         ).execute()
         rows = result.get("values", [])
-        if not rows:
+        data_rows = [r for r in rows if len(r) >= 2]
+        if not data_rows:
             return "💡 No ideas saved yet."
-        recent = rows[-10:]
-        return "💡 *Your ideas:*\n\n" + "\n".join(
-            [f"{i+1}. {r[1]} _({r[0]})_" for i, r in enumerate(recent) if len(r) >= 2]
-        )
+        sliced, offset = _slice_data_rows(data_rows, range_start, range_end, count, range_all)
+        total = len(data_rows)
+        header = f"💡 *Your ideas* (showing {offset+1}–{offset+len(sliced)} of {total}):"
+        lines = [header, ""]
+        for i, r in enumerate(sliced):
+            lines.append(f"{offset + i + 1}. {r[1]} _({r[0]})_")
+        if range_all and total > WHATSAPP_NOTE_LIMIT:
+            lines.append(f"\n_⚠️ Showing last {WHATSAPP_NOTE_LIMIT} of {total} ideas (WhatsApp limit). Use “list ideas N-M” for a specific range._")
+        return "\n".join(lines)
     except Exception:
         conn = sqlite3.connect("bot.db")
         rows = conn.execute("SELECT content, timestamp FROM ideas ORDER BY id DESC LIMIT 10").fetchall()
@@ -996,19 +1008,52 @@ def save_note(text: str) -> str:
     except Exception as e:
         return f"📝 Note saved locally.\n🧠 Memorized for semantic search.\n⚠️ Sheets sync failed: {str(e)}"
 
-def get_notes() -> str:
+WHATSAPP_CHAR_LIMIT = 4000
+WHATSAPP_NOTE_LIMIT = 60  # ~60 notes fit safely within WhatsApp's display limit
+
+def _slice_data_rows(data_rows: list, range_start=None, range_end=None, count=None, range_all=False) -> tuple:
+    """Return (sliced_rows, offset) based on range params.
+    offset is the 0-based index of sliced_rows[0] inside data_rows.
+    Displayed number = offset + i + 1.
+    """
+    total = len(data_rows)
+    if range_all:
+        # Cap at WhatsApp safe limit
+        start = max(0, total - WHATSAPP_NOTE_LIMIT)
+        return data_rows[start:], start
+    if range_start is not None and range_end is not None:
+        # User asked for notes N-M (1-based, inclusive)
+        s = max(0, int(range_start) - 1)
+        e = min(total, int(range_end))
+        return data_rows[s:e], s
+    if count is not None:
+        # Show last N
+        n = min(int(count), WHATSAPP_NOTE_LIMIT)
+        start = max(0, total - n)
+        return data_rows[start:], start
+    # Default: last 10
+    start = max(0, total - 10)
+    return data_rows[start:], start
+
+def get_notes(range_start=None, range_end=None, count=None, range_all=False) -> str:
     try:
         _, sheets_svc, _ = get_google_services()
         result = sheets_svc.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID, range="Notes!A:B"
         ).execute()
         rows = result.get("values", [])
-        if not rows:
+        data_rows = [r for r in rows if len(r) >= 2]
+        if not data_rows:
             return "📝 No notes saved yet."
-        recent = rows[-10:]
-        return "📝 *Your notes:*\n\n" + "\n".join(
-            [f"{i+1}. {r[1]} _({r[0]})_" for i, r in enumerate(recent) if len(r) >= 2]
-        )
+        sliced, offset = _slice_data_rows(data_rows, range_start, range_end, count, range_all)
+        total = len(data_rows)
+        header = f"📝 *Your notes* (showing {offset+1}–{offset+len(sliced)} of {total}):"
+        lines = [header, ""]
+        for i, r in enumerate(sliced):
+            lines.append(f"{offset + i + 1}. {r[1]} _({r[0]})_")
+        if range_all and total > WHATSAPP_NOTE_LIMIT:
+            lines.append(f"\n_⚠️ Showing last {WHATSAPP_NOTE_LIMIT} of {total} notes (WhatsApp limit). Use “list notes N-M” for a specific range._")
+        return "\n".join(lines)
     except Exception:
         conn = sqlite3.connect("bot.db")
         rows = conn.execute("SELECT content, timestamp FROM notes ORDER BY id DESC LIMIT 10").fetchall()
@@ -1037,16 +1082,41 @@ def save_task(text: str) -> str:
     except Exception as e:
         return f"✅ Task saved locally.\n⚠️ Google Tasks sync failed: {str(e)}"
 
-def get_tasks() -> str:
+def get_tasks(range_start=None, range_end=None, count=None, range_all=False) -> str:
     try:
         _, _, tasks_svc = get_google_services()
-        result = tasks_svc.tasks().list(tasklist="@default", showCompleted=False).execute()
+        result = tasks_svc.tasks().list(tasklist="@default", showCompleted=False, maxResults=100).execute()
         items  = result.get("items", [])
         if not items:
             return "📋 No pending tasks."
-        return "📋 *Your tasks:*\n\n" + "\n".join(
-            [f"{i+1}. {t['title']}" for i, t in enumerate(items[:10])]
-        )
+        total = len(items)
+        # Convert items list to same shape as data_rows for _slice_data_rows
+        # We only need the slice indices here
+        if range_all:
+            start = max(0, total - WHATSAPP_NOTE_LIMIT)
+            sliced = items[start:]
+            offset = start
+        elif range_start is not None and range_end is not None:
+            s = max(0, int(range_start) - 1)
+            e = min(total, int(range_end))
+            sliced = items[s:e]
+            offset = s
+        elif count is not None:
+            n = min(int(count), WHATSAPP_NOTE_LIMIT)
+            start = max(0, total - n)
+            sliced = items[start:]
+            offset = start
+        else:
+            start = max(0, total - 10)
+            sliced = items[start:]
+            offset = start
+        header = f"📋 *Your tasks* (showing {offset+1}–{offset+len(sliced)} of {total}):"
+        lines = [header, ""]
+        for i, t in enumerate(sliced):
+            lines.append(f"{offset + i + 1}. {t['title']}")
+        if range_all and total > WHATSAPP_NOTE_LIMIT:
+            lines.append(f"\n_⚠️ Showing last {WHATSAPP_NOTE_LIMIT} of {total} tasks (WhatsApp limit). Use “list tasks N-M” for a specific range._")
+        return "\n".join(lines)
     except Exception:
         conn = sqlite3.connect("bot.db")
         rows = conn.execute("SELECT content FROM tasks WHERE done=0 ORDER BY id DESC LIMIT 10").fetchall()
@@ -1597,9 +1667,12 @@ def delete_note(keyword: str = None, index: int = None) -> str:
             return "📝 No notes to delete."
 
         # Find target row
+        # index here is the displayed number from get_notes (1-based, offset-aware)
         target_i = None
         if index is not None:
-            i = int(index) - 1
+            # displayed numbers start from (len(data_rows)-len(recent)+1);
+            # convert displayed number directly to 0-based data_rows index
+            i = int(index) - 1   # 0-based absolute index into data_rows
             if 0 <= i < len(data_rows):
                 target_i = i
         elif keyword:
@@ -1615,6 +1688,7 @@ def delete_note(keyword: str = None, index: int = None) -> str:
         # Sheet row index (1-based, +1 for header if exists)
         header_offset = 1 if rows and rows[0][0].lower() in ("timestamp", "time", "ts", "a") else 0
         sheet_row = target_i + 1 + header_offset  # 1-based
+
 
         sheet_id = sheets_svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
         notes_sheet_id = next((s["properties"]["sheetId"] for s in sheet_id["sheets"] if s["properties"]["title"] == "Notes"), None)
@@ -1648,7 +1722,8 @@ def edit_note(new_content: str, keyword: str = None, index: int = None) -> str:
 
         target_i = None
         if index is not None:
-            i = int(index) - 1
+            # index is the displayed number from get_notes (offset-aware, 1-based absolute)
+            i = int(index) - 1   # 0-based absolute index into data_rows
             if 0 <= i < len(data_rows):
                 target_i = i
         elif keyword:
@@ -1697,7 +1772,8 @@ def delete_idea(keyword: str = None, index: int = None) -> str:
 
         target_i = None
         if index is not None:
-            i = int(index) - 1
+            # index is the displayed number from get_ideas (offset-aware, 1-based absolute)
+            i = int(index) - 1   # 0-based absolute index into data_rows
             if 0 <= i < len(data_rows):
                 target_i = i
         elif keyword:
@@ -1744,7 +1820,8 @@ def edit_idea(new_content: str, keyword: str = None, index: int = None) -> str:
 
         target_i = None
         if index is not None:
-            i = int(index) - 1
+            # index is the displayed number from get_ideas (offset-aware, 1-based absolute)
+            i = int(index) - 1   # 0-based absolute index into data_rows
             if 0 <= i < len(data_rows):
                 target_i = i
         elif keyword:
@@ -2017,7 +2094,12 @@ def webhook():
         reply_text = complete_task(keyword)
 
     elif intent == "get_tasks":
-        reply_text = get_tasks()
+        reply_text = get_tasks(
+            range_start=params.get("range_start"),
+            range_end=params.get("range_end"),
+            count=params.get("count"),
+            range_all=bool(params.get("range_all")),
+        )
 
     elif intent == "add_task":
         content    = params.get("content") or re.sub(
@@ -2026,7 +2108,12 @@ def webhook():
         reply_text = save_task(content)
 
     elif intent == "get_notes":
-        reply_text = get_notes()
+        reply_text = get_notes(
+            range_start=params.get("range_start"),
+            range_end=params.get("range_end"),
+            count=params.get("count"),
+            range_all=bool(params.get("range_all")),
+        )
 
     elif intent == "add_note":
         content    = params.get("content") or re.sub(
@@ -2035,7 +2122,12 @@ def webhook():
         reply_text = save_note(content)
 
     elif intent == "get_ideas":
-        reply_text = get_ideas()
+        reply_text = get_ideas(
+            range_start=params.get("range_start"),
+            range_end=params.get("range_end"),
+            count=params.get("count"),
+            range_all=bool(params.get("range_all")),
+        )
 
     elif intent == "add_idea":
         content    = params.get("content") or re.sub(
