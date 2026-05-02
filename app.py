@@ -282,12 +282,19 @@ GREEN_API_TOKEN_VAL   = os.environ['GREEN_API_TOKEN']
 GREEN_API_BASE        = f"https://api.green-api.com/waInstance{os.environ['GREEN_API_INSTANCE_ID']}"
 
 def send_whatsapp(to: str, body: str):
-    """Send a WhatsApp message via Green API."""
+    """Send a WhatsApp message via Green API.
+    `to` can be '628xxx@c.us' (from webhook) or '628xxx' (from YOUR_NUMBER env var).
+    """
     url = f"{GREEN_API_BASE}/sendMessage/{os.environ['GREEN_API_TOKEN']}"
-    payload = {"chatId": f"{to}@c.us", "message": body}
+    # Normalise: strip whatsapp: prefix, add @c.us only if missing
+    chat_id = to.replace("whatsapp:", "").strip()
+    if not chat_id.endswith("@c.us"):
+        chat_id = f"{chat_id}@c.us"
+    payload = {"chatId": chat_id, "message": body}
+    print(f"[Green API] sending to={chat_id}")
     try:
         r = requests.post(url, json=payload, timeout=10)
-        print(f"[Green API] sendMessage status={r.status_code} body={r.text[:120]}")
+        print(f"[Green API] sendMessage status={r.status_code} body={r.text[:200]}")
     except Exception as e:
         print(f"[Green API] sendMessage error: {e}")
 SPREADSHEET_ID        = os.environ["GOOGLE_SHEET_ID"]
@@ -2034,13 +2041,20 @@ def webhook():
     # We extract the text, process it, then reply via sendMessage REST call.
     # No TwiML needed - just return 200 OK.
     data = request.get_json(force=True, silent=True) or {}
-    print(f"[Green API raw] {json.dumps(data)[:300]}")  # DEBUG - remove after confirmed working
+    print(f"[Green API raw] {json.dumps(data)[:300]}")  # DEBUG
 
-    # Only handle incoming text messages
+    # Only process incoming messages (ignore outgoing/status webhooks to prevent loop)
+    webhook_type = data.get("typeWebhook", "")
+    if webhook_type != "incomingMessageReceived":
+        print(f"[Webhook] Ignored typeWebhook={webhook_type}")
+        return "ok", 200
+
+    # Only handle text messages
     msg_data  = data.get("messageData", {})
     type_msg  = msg_data.get("typeMessage", "")
     if type_msg != "textMessage":
-        return "ok", 200   # ignore media, status pings, etc.
+        print(f"[Webhook] Ignored typeMessage={type_msg}")
+        return "ok", 200
 
     incoming  = msg_data.get("textMessageData", {}).get("textMessage", "").strip()
     sender    = data.get("senderData", {}).get("chatId", "")  # e.g. 628xxx@c.us
