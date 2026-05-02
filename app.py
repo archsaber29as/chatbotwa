@@ -277,11 +277,13 @@ NEWS_API_KEY          = os.environ["NEWS_API_KEY"]
 YOUR_NUMBER           = os.environ["YOUR_NUMBER"]   # e.g. 628123456789 (no + or whatsapp: prefix)
 GREEN_API_INSTANCE    = os.environ["GREEN_API_INSTANCE_ID"]
 GREEN_API_TOKEN       = os.environ["GREEN_API_TOKEN"]
-GREEN_API_BASE        = f"https://api.green-api.com/waInstance{os.environ['GREEN_API_INSTANCE_ID']}/{os.environ['GREEN_API_TOKEN']}"
+GREEN_API_INSTANCE    = os.environ['GREEN_API_INSTANCE_ID']
+GREEN_API_TOKEN_VAL   = os.environ['GREEN_API_TOKEN']
+GREEN_API_BASE        = f"https://api.green-api.com/waInstance{os.environ['GREEN_API_INSTANCE_ID']}"
 
 def send_whatsapp(to: str, body: str):
     """Send a WhatsApp message via Green API."""
-    url = f"{GREEN_API_BASE}/sendMessage"
+    url = f"{GREEN_API_BASE}/sendMessage/{os.environ['GREEN_API_TOKEN']}"
     payload = {"chatId": f"{to}@c.us", "message": body}
     try:
         r = requests.post(url, json=payload, timeout=10)
