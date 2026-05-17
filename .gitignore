@@ -1,5 +1,30 @@
+# Secrets
 environtment.env
+.env
 token.pickle
 credentials.json
+token.json
+token
+token_b64
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Runtime / DB
+bot.db
+bot_all.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
 Procfile
 refresh_token.py
+railway.toml

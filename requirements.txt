@@ -13,3 +13,4 @@ google-genai
 psycopg2-binary
 pytz
 groq
+tracer
